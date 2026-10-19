@@ -1,0 +1,29 @@
+[package]
+name = "zoria-arsiv"
+version = "0.3.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "arsiv_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+arsiv-core = { path = "../crates/arsiv-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = ["custom-protocol"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-updater = "2.13.3"
+dunce = "1"
+
+[features]
+# Debug builds always have the web inspector; release builds only when this
+# feature is requested explicitly (`cargo tauri build --features devtools`).
+devtools = ["tauri/devtools"]

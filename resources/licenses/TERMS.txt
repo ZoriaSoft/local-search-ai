@@ -1,0 +1,19 @@
+﻿ZORIA ARŞİV — TERMS OF USE
+
+© 2026 ZoriaSoft  https://zoriasoft.com
+Source code: https://github.com/ZoriaSoft/local-search-ai
+
+1. Free and open source
+Zoria Arşiv is free, open-source software licensed under the Apache License, Version 2.0. You may use it on any number of computers, for personal or business use, and copy, modify and distribute it under the terms of that license. No license key, subscription or account is needed. The full license text is in the LICENSE file and on the About page.
+
+2. Privacy
+Zoria Arşiv runs entirely on this computer. Your documents, the index and your searches are never sent to any server; the app collects no data and contains no ads or usage tracking. Index files are kept only in your user folder on this computer and can be deleted when you uninstall the app. The app only reads your documents; it never changes, moves or deletes any of your files.
+
+3. Names and logos
+The Apache License does not grant permission to use the names "Zoria", "Zoria Arşiv" or "ZoriaSoft" or their logos. A modified version must not be presented as the original or as endorsed by ZoriaSoft.
+
+4. No warranty
+Zoria Arşiv is provided "as is", without warranty of any kind. Search and text recognition (OCR) results are not guaranteed to be complete or error-free. To the extent permitted by law, ZoriaSoft is not liable for any direct or indirect damage arising from the use of the app (Apache License 2.0, sections 7 and 8).
+
+5. Third-party components
+Zoria Arşiv includes open-source components distributed under their own licenses (Tesseract OCR, PDFium, EmbeddingGemma 2, ONNX Runtime, Tauri and others). These components are covered by their own licenses, not by these terms. The full list and license texts are on the About page and in licenses\THIRD_PARTY_NOTICES.txt in the installation folder. LGPL/GPL components are distributed unmodified as separate files; their source code is available from the respective projects and from ZoriaSoft on request.

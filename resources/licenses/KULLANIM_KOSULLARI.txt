@@ -1,0 +1,19 @@
+﻿ZORIA ARŞİV — KULLANIM KOŞULLARI
+
+© 2026 ZoriaSoft  https://zoriasoft.com
+Kaynak kod: https://github.com/ZoriaSoft/local-search-ai
+
+1. Ücretsiz ve açık kaynak
+Zoria Arşiv, Apache Lisansı 2.0 ile lisanslanmış ücretsiz ve açık kaynak bir yazılımdır. Kişisel ve kurumsal amaçla, bilgisayar sayısı sınırı olmadan kullanılabilir; bu lisansın koşullarına uyarak kopyalanabilir, değiştirilebilir ve dağıtılabilir. Lisans anahtarı, abonelik ya da hesap gerekmez. Lisansın tam metni LICENSE dosyasında ve Hakkında sayfasındadır.
+
+2. Gizlilik
+Zoria Arşiv tamamen bu bilgisayarda çalışır. Belgeleriniz, dizin ve aramalarınız hiçbir sunucuya gönderilmez; uygulama veri toplamaz, reklam ya da kullanım ölçümü içermez. Dizin dosyaları yalnızca bu bilgisayardaki kullanıcı klasöründe tutulur ve uygulama kaldırılırken silinebilir. Uygulama belgelerinizi yalnızca okur; hiçbir dosyanızı değiştirmez, taşımaz ya da silmez.
+
+3. Ad ve logolar
+Apache Lisansı "Zoria", "Zoria Arşiv" ve "ZoriaSoft" adlarını ya da logolarını kullanma izni vermez. Değiştirilmiş bir sürüm, orijinal sürüm ya da ZoriaSoft tarafından onaylanmış gibi sunulamaz.
+
+4. Garanti ve sorumluluk
+Zoria Arşiv "olduğu gibi", hiçbir garanti verilmeden sunulur. Arama ve metin tanıma (OCR) sonuçlarının eksiksiz ya da hatasız olacağı garanti edilmez. Yürürlükteki mevzuatın izin verdiği ölçüde ZoriaSoft, uygulamanın kullanımından doğan doğrudan ya da dolaylı zararlardan sorumlu tutulamaz (Apache Lisansı 2.0, 7. ve 8. bölümler).
+
+5. Üçüncü taraf bileşenler
+Zoria Arşiv, kendi lisansları altında dağıtılan açık kaynak bileşenler içerir (Tesseract OCR, PDFium, EmbeddingGemma 2, ONNX Runtime, Tauri ve diğerleri). Bu bileşenler bu koşullara değil, kendi lisanslarına tabidir. Tam liste ve lisans metinleri, uygulamadaki Hakkında sayfasında ve kurulum klasöründeki licenses\THIRD_PARTY_NOTICES.txt dosyasındadır. LGPL/GPL lisanslı bileşenler değiştirilmeden, ayrı dosyalar olarak dağıtılır; kaynak kodları ilgili projelerden edinilebilir ve talep hâlinde ZoriaSoft tarafından da sağlanır.

@@ -1,0 +1,12 @@
+target/
+dist/
+node_modules/
+*.tsbuildinfo
+.tmp/
+# Fetched by scripts/fetch-semantic-model.sh (sha256-pinned, too large for git)
+resources/models/
+resources/ort/
+# Placed by hand before a build (see README): PDFium and the Tesseract binaries
+resources/pdfium/
+resources/bin/*
+!resources/bin/README.txt

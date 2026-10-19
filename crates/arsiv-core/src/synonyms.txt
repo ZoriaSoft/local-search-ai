@@ -1,0 +1,53 @@
+# Ofis eşanlamlıları (elle yazıldı). Her satır bir grup; virgülle ayrılır.
+# Tek kelimelik, küçük harf, Türkçe yazım. Bir kelime yalnız bir grupta olsun.
+# Sorgudaki kelime (ya da kökü) bir grupta geçerse, grubun diğer kelimeleri
+# düşük ağırlıkla sorguya eklenir. Ağırlık laboratuvar derleminde ölçüldü.
+fatura, makbuz
+kira, icar
+kiracı, müstecir
+sözleşme, mukavele, kontrat, anlaşma, mutabakat
+dilekçe, başvuru
+talep, istek
+maaş, bordro
+çalışan, personel, işçi
+işveren, patron
+şirket, firma, işletme
+müdür, yönetici
+tutanak, zabıt
+vekaletname, vekalet
+avukat, vekil
+ihtarname, ihtar
+bildirim, tebligat, tebliğ
+fesih, iptal
+taahhütname, taahhüt
+teminat, güvence, depozito
+sigorta, poliçe
+belge, evrak, doküman
+dekont, havale
+senet, bono
+gider, masraf, harcama
+gelir, hasılat
+indirim, iskonto
+fiyat, bedel, ücret
+teklif, öneri
+sipariş, siparişname
+teslim, teslimat
+irsaliye, sevkiyat
+adres, ikametgah
+konut, mesken, daire
+arsa, parsel
+araç, taşıt, vasıta
+karar, hüküm
+şikayet, yakınma
+dava, kovuşturma
+toplantı, görüşme
+rapor, bildirge
+beyanname, beyan
+vergi, mükellefiyet
+öğrenci, talebe
+okul, mektep
+sınav, imtihan
+izin, müsaade
+onay, tasdik
+imza, paraf
+kaşe, mühür

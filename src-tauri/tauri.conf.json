@@ -1,0 +1,75 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Zoria Arşiv",
+  "version": "0.3.0",
+  "identifier": "com.zoria.arsiv",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeDevCommand": "npm run dev -- --port 1420 --strictPort",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Zoria Arşiv",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 980,
+        "minHeight": 620
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "publisher": "ZoriaSoft",
+    "copyright": "© 2026 ZoriaSoft. Apache License 2.0.",
+    "licenseFile": "../resources/licenses/INSTALLER_TERMS.txt",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "../resources/pdfium/*": "pdfium/",
+      "../resources/tessdata/*": "tessdata/",
+      "../resources/bin/*": "bin/",
+      "../resources/models/*": "models/",
+      "../resources/ort/*": "ort/",
+      "../resources/licenses/*": "licenses/",
+      "../LICENSE": "licenses/LICENSE.txt"
+    },
+    "windows": {
+      "nsis": {
+        "displayLanguageSelector": false,
+        "languages": [
+          "English",
+          "Turkish"
+        ]
+      }
+    },
+    "shortDescription": "Offline document search",
+    "longDescription": "Zoria Arşiv finds words inside PDFs, scans, photos, Word, Excel and text files on your computer. Everything runs offline.",
+    "homepage": "https://github.com/ZoriaSoft/local-search-ai"
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": [
+        "https://github.com/ZoriaSoft/local-search-ai/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true,
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

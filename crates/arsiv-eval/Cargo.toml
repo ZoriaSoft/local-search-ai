@@ -1,0 +1,12 @@
+[package]
+name = "arsiv-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arsiv-core = { path = "../arsiv-core" }
+serde.workspace = true
+serde_json.workspace = true
