@@ -56,14 +56,29 @@ export const tr = {
     allKinds: "Tümü",
     date: "Tarih",
     dateOptions: { all: "Tüm zamanlar", week: "Son 7 gün", month: "Son 30 gün", year: "Bu yıl" },
+    size: "Boyut",
+    sizeOptions: { all: "Tüm boyutlar", small: "1 MB'tan küçük", medium: "1–10 MB", large: "10 MB'tan büyük" },
   },
-  kind: { pdf: "PDF", image: "Görsel", word: "Word", excel: "Excel", text: "Metin", log: "Günlük (log)" } satisfies Record<FileKind, string>,
+  kind: {
+    pdf: "PDF",
+    image: "Görsel",
+    word: "Word",
+    excel: "Excel",
+    presentation: "Sunum",
+    official: "Resmî yazı",
+    email: "E-posta",
+    text: "Metin",
+    log: "Günlük (log)",
+  } satisfies Record<FileKind, string>,
   kindFiles: {
     pdf: ".pdf",
     image: ".jpg .png .tif .bmp",
-    word: ".docx",
-    excel: ".xlsx .xlsm",
-    text: ".txt .csv .md .json .xml",
+    word: ".docx .odt .rtf",
+    excel: ".xlsx .xlsm .xls .ods",
+    presentation: ".pptx .odp",
+    official: ".udf (UYAP) .eyp (e-Yazışma)",
+    email: ".eml (ekleriyle)",
+    text: ".txt .csv .md .json .xml .html",
     log: ".log (büyük olabilir)",
   } satisfies Record<FileKind, string>,
   kinds: {
@@ -81,6 +96,71 @@ export const tr = {
     summary: (labels: string[]) => labels.join(", "),
     removeWarning: (labels: string[]) =>
       `${labels.join(", ")} dosyaları bu klasörün aramasından çıkarılacak (dosyalarınız silinmez).`,
+  },
+  help: {
+    button: "Nasıl aranır?",
+    open: "Tüm arama yöntemleri",
+    title: "Nasıl aranır?",
+    lead: "Bir örneğe tıklayın, arama kutusuna yazılsın ve sonuçlar gelsin.",
+    tryIt: "Bu aramayı dene",
+    close: "Kapat",
+    note: "VE, VEYA, DEĞİL ve YAKIN büyük harfle yazılır. Küçük harfle yazılan \"ve\" normal kelime sayılır. Dosya türü, tarih ve boyut için arama sonuçlarının üstündeki seçenekleri kullanın.",
+    sections: [
+      {
+        title: "Temel arama",
+        items: [
+          { example: "sozlesme", text: "Türkçe karakter yazmasanız da bulur (sözleşme, sözleşmesi…)." },
+          { example: "kira sözleşmesi", text: "Birden çok kelime: hepsini içeren belgeler üstte çıkar." },
+          { example: "\"kira bedeli\"", text: "Tırnak içi: kelimeler bu sırayla, yan yana geçmeli." },
+          { example: "2024/1548", text: "Dosya no, plaka, tutar gibi değerleri yazıldığı gibi arayın." },
+        ],
+      },
+      {
+        title: "Dahil et, hariç tut",
+        items: [
+          { example: "kira VE depozito", text: "İki kelime de belgede geçmeli." },
+          { example: "+depozito kira", text: "Artı işaretli kelime mutlaka geçmeli." },
+          { example: "fatura VEYA makbuz", text: "İkisinden biri yeter." },
+          { example: "kira -depozito", text: "Eksi işaretli kelime geçen belgeler hiç gelmez." },
+          { example: "kira DEĞİL depozito", text: "Eksi ile aynı: depozito geçen belgeler gelmez." },
+        ],
+      },
+      {
+        title: "Yakınlık ve tamamlama",
+        items: [
+          { example: "kira YAKIN/5 bedel", text: "İki kelime arasında en fazla 5 kelime olsun (sıra fark etmez)." },
+          { example: "sözleş*", text: "Yıldız: sözleşme, sözleşmeli, sözleşmesiz… hepsi." },
+          { example: "dilek?e", text: "Soru işareti tek harfin yerini tutar." },
+        ],
+      },
+      {
+        title: "Benzer yazım ve eş anlamlılar",
+        items: [
+          { example: "ocak~", text: "Bir harfi farklı yazılmışları da bulur; kısa kelimelerde de çalışır (yazım ve tarama hataları)." },
+          { example: "imzalandı~2", text: "İki harfe kadar farkı kabul eder; daha geniş arar." },
+          { example: "kira&", text: "Eş anlamlıları (icar) kelimenin kendisi kadar önemli sayar." },
+        ],
+      },
+    ],
+  },
+  schedule: {
+    edit: "Güncelleme",
+    title: "Bu klasör ne zaman güncellensin?",
+    live: "Anında",
+    liveHelp: "Klasördeki değişiklikler izlenir ve hemen dizine yansır.",
+    timed: "Zaman ayarlı",
+    timedHelp: "Yeni ve değişen dosyalar yalnızca seçtiğiniz gün ve saatlerde okunur; gün içinde bilgisayar yorulmaz.",
+    days: "Günler",
+    everyDay: "Her gün",
+    dayNames: ["Pzt", "Sal", "Çar", "Per", "Cum", "Cmt", "Paz"],
+    dayLong: ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"],
+    from: "Başlangıç",
+    to: "Bitiş",
+    overnight: "Bitiş ertesi gün",
+    note: "Zoria Arşiv açıkken çalışır. Süre dolunca tarama durur; kalan dosyalar bir sonraki seferde okunur. \"Yeniden tara\" ile istediğiniz an da güncelleyebilirsiniz.",
+    summaryLive: "Anında güncellenir",
+    summaryTimed: (days: string, from: string, to: string, overnight: boolean) =>
+      `Zaman ayarlı: ${days}, ${from}–${to}${overnight ? " (ertesi gün)" : ""}`,
   },
   source: {
     text_layer: "Metin katmanı",
@@ -115,7 +195,7 @@ export const tr = {
   },
   folders: {
     title: "Klasörler",
-    lead: "Aranacak klasörleri buradan yönetin. Klasörlerdeki değişiklikler otomatik izlenir ve dizine yansır.",
+    lead: "Aranacak klasörleri buradan yönetin. Klasörlerdeki değişiklikler otomatik izlenir ya da seçtiğiniz saatlerde dizine yansır.",
     empty: "Henüz klasör eklenmedi.",
     columns: { folder: "Klasör", files: "Dosyalar", status: "Durum", lastScan: "Son tarama", kinds: "Dosya türleri" },
     healthy: "Sorunsuz",
@@ -204,7 +284,7 @@ export const tr = {
     lead: "Bilgisayarınızdaki belgeleri içerikleriyle birlikte arayın. Taranmış evraklar dahil her şey bu bilgisayarda okunur.",
     steps: [
       { title: "Klasör seçin", body: "Belgelerinizin bulunduğu klasörü seçin. Alt klasörler de dahil edilir." },
-      { title: "Dosya türlerini belirleyin", body: "PDF, Word, Excel, görsel ve metin dosyalarından hangilerinin okunacağını seçin." },
+      { title: "Dosya türlerini belirleyin", body: "PDF, Word, Excel, sunum, UDF/EYP, e-posta, görsel ve metin dosyalarından hangilerinin okunacağını seçin." },
       { title: "Aramaya başlayın", body: "Okuma arka planda sürer; ilk belgeler hazır olur olmaz arayabilirsiniz." },
     ],
     action: "İlk klasörü ekle",
@@ -264,7 +344,7 @@ export const tr = {
   empty: {
     firstTitle: "Arşivinize bir klasör ekleyin",
     firstBody:
-      "Zoria Arşiv seçtiğiniz klasörlerdeki PDF, taranmış görsel, Word, Excel ve metin (TXT) dosyalarını bu bilgisayarda okur ve dizinler. Hiçbir dosya internete gönderilmez.",
+      "Zoria Arşiv seçtiğiniz klasörlerdeki PDF, taranmış görsel, Word, Excel, sunum, UYAP (UDF), e-Yazışma (EYP), e-posta ve metin dosyalarını bu bilgisayarda okur ve dizinler. Hiçbir dosya internete gönderilmez.",
     readyTitle: "Aramaya hazır",
     readyBody: (n: number) => `${n} belge dizinlendi. Bir kelime, isim, tutar ya da belge numarası yazın.`,
     tips: [
@@ -292,6 +372,7 @@ export const tr = {
     folder_duplicate: "Bu klasör zaten arşivde.",
     folder_nested: "Bu klasör, arşivdeki başka bir klasörün içinde ya da onu kapsıyor.",
     kinds_empty: "En az bir dosya türü seçin.",
+    schedule_invalid: "En az bir gün seçin; başlangıç ve bitiş saati farklı olsun.",
     file_missing: "Dosya artık bulunamıyor; taşınmış veya silinmiş olabilir.",
     not_indexed: "Bu dosya henüz dizinlenmemiş.",
     index_busy: "Dizin şu anda meşgul. Birazdan tekrar deneyin.",

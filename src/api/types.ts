@@ -1,15 +1,16 @@
 // TypeScript mirror of docs/API.md. Offsets are UTF-16 code units.
 
-export type FileKind = "pdf" | "image" | "word" | "excel" | "text" | "log";
-export const FILE_KINDS: FileKind[] = ["pdf", "image", "word", "excel", "text", "log"];
+export type FileKind = "pdf" | "image" | "word" | "excel" | "presentation" | "official" | "email" | "text" | "log";
+export const FILE_KINDS: FileKind[] = ["pdf", "image", "word", "excel", "presentation", "official", "email", "text", "log"];
 /** Kinds a new folder starts with: everything but `.log` (can be huge). */
-export const DEFAULT_KINDS: FileKind[] = ["pdf", "image", "word", "excel", "text"];
+export const DEFAULT_KINDS: FileKind[] = ["pdf", "image", "word", "excel", "presentation", "official", "email", "text"];
 
 export type ErrorCode =
   | "folder_missing"
   | "folder_duplicate"
   | "folder_nested"
   | "kinds_empty"
+  | "schedule_invalid"
   | "file_missing"
   | "not_indexed"
   | "index_busy"
@@ -39,6 +40,14 @@ export interface FolderInfo {
   missing: boolean; // the folder itself is gone; its records are kept
   kinds: FileKind[]; // kinds indexed in this folder; never empty
   pendingEmbedCount?: number; // text read, semantic index pending (0 without a model)
+  schedule?: FolderSchedule | null; // timed updates; null/absent = watched live
+}
+
+/** Timed folder updates, in the computer's local time. */
+export interface FolderSchedule {
+  days: number[]; // 0 = Monday … 6 = Sunday; a window past midnight belongs to its start day
+  start: number; // minutes after midnight, 0–1439
+  end: number; // at or before start = ends the next day
 }
 
 export type IndexPhase = "idle" | "scanning" | "indexing" | "embedding" | "committing";
@@ -69,6 +78,8 @@ export interface SearchRequest {
   kinds: FileKind[];
   modifiedAfter: number | null;
   modifiedBefore: number | null;
+  minSize?: number | null; // bytes, inclusive
+  maxSize?: number | null;
   limit: number;
   offset: number;
 }

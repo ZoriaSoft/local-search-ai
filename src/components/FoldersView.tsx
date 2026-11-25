@@ -2,12 +2,13 @@ import { useRef, useState } from "react";
 
 import type { Backend } from "../api/client";
 import { toApiError } from "../api/client";
-import type { FileKind, FolderInfo, IndexProgress } from "../api/types";
+import type { FileKind, FolderInfo, FolderSchedule, IndexProgress } from "../api/types";
 import { t } from "../i18n";
 import { formatCount, formatDateTime } from "../lib/format";
 import { holdRatio, progressRatio, type ShownRatio } from "../lib/progress";
 import { AlertIcon, CheckIcon, FolderIcon, FolderPlusIcon, RefreshIcon, WarnIcon } from "./Icons";
 import { KindPicker, kindSummary } from "./KindPicker";
+import { ScheduleEditor, scheduleSummary } from "./ScheduleEditor";
 
 interface Props {
   backend: Backend;
@@ -28,6 +29,8 @@ interface Props {
 export function FoldersView({ backend, folders, adding, progress, semantic, issueCount, onAddFolder, onFoldersChanged, onShowIssues, onError }: Props) {
   // Folder whose kinds are being edited, and the unsaved choice.
   const [editing, setEditing] = useState<{ id: number; kinds: FileKind[] } | null>(null);
+  // Folder whose update timing is being edited.
+  const [scheduling, setScheduling] = useState<number | null>(null);
   const busy = progress.phase !== "idle";
   // Bar fill: both stages, never moving back within a run.
   const shown = useRef<ShownRatio | null>(null);
@@ -72,6 +75,16 @@ export function FoldersView({ backend, folders, adding, progress, semantic, issu
     try {
       await backend.setFolderKinds(folder.id, kinds);
       setEditing(null);
+      onFoldersChanged();
+    } catch (error) {
+      fail(error);
+    }
+  };
+
+  const saveSchedule = async (folder: FolderInfo, schedule: FolderSchedule | null) => {
+    try {
+      await backend.setFolderSchedule(folder.id, schedule);
+      setScheduling(null);
       onFoldersChanged();
     } catch (error) {
       fail(error);
@@ -201,6 +214,7 @@ export function FoldersView({ backend, folders, adding, progress, semantic, issu
                       <bdi>{folder.path}</bdi>
                     </div>
                     <div className="folder-kinds">{kindSummary(folder.kinds)}</div>
+                    <div className="folder-kinds">{scheduleSummary(folder.schedule)}</div>
                   </div>
                 </div>
                 <div className="num">
@@ -227,8 +241,23 @@ export function FoldersView({ backend, folders, adding, progress, semantic, issu
                   <button className="btn small" onClick={() => reindex(folder.id)} disabled={busy}>
                     {t.index.reindex}
                   </button>
-                  <button className="btn small" onClick={() => setEditing(editing?.id === folder.id ? null : { id: folder.id, kinds: folder.kinds })}>
+                  <button
+                    className="btn small"
+                    onClick={() => {
+                      setScheduling(null);
+                      setEditing(editing?.id === folder.id ? null : { id: folder.id, kinds: folder.kinds });
+                    }}
+                  >
                     {t.kinds.edit}
+                  </button>
+                  <button
+                    className="btn small"
+                    onClick={() => {
+                      setEditing(null);
+                      setScheduling(scheduling === folder.id ? null : folder.id);
+                    }}
+                  >
+                    {t.schedule.edit}
                   </button>
                   <button className="btn small quiet-danger" onClick={() => remove(folder)}>
                     {t.index.remove}
@@ -240,6 +269,13 @@ export function FoldersView({ backend, folders, adding, progress, semantic, issu
                   <WarnIcon size={14} />
                   <span>{t.index.missingHelp}</span>
                 </div>
+              )}
+              {scheduling === folder.id && (
+                <ScheduleEditor
+                  value={folder.schedule ?? null}
+                  onSave={(schedule) => void saveSchedule(folder, schedule)}
+                  onCancel={() => setScheduling(null)}
+                />
               )}
               {editing?.id === folder.id && (
                 <form

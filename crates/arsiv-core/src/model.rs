@@ -14,17 +14,41 @@ pub enum FileKind {
     /// `.log` files: plain text like `Text`, but a kind of its own because
     /// logs can be huge and noisy; new folders leave it off.
     Log,
+    /// Slides: `.pptx`, `.odp` (one page per slide).
+    Presentation,
+    /// Saved e-mails (`.eml`) with their attachments.
+    Email,
+    /// Turkish official documents: UYAP `.udf`, e-Yazışma `.eyp` packages.
+    Official,
 }
 
 impl FileKind {
     /// Every kind, in the order the UI lists them.
-    pub const ALL: [FileKind; 6] =
-        [FileKind::Pdf, FileKind::Image, FileKind::Word, FileKind::Excel, FileKind::Text, FileKind::Log];
+    pub const ALL: [FileKind; 9] = [
+        FileKind::Pdf,
+        FileKind::Image,
+        FileKind::Word,
+        FileKind::Excel,
+        FileKind::Presentation,
+        FileKind::Official,
+        FileKind::Email,
+        FileKind::Text,
+        FileKind::Log,
+    ];
 
     /// The default selection: every kind except `Log`. A folder with no
     /// stored selection indexes these (so folders added before `Log` existed
     /// keep exactly what they had).
-    pub const DEFAULT: [FileKind; 5] = [FileKind::Pdf, FileKind::Image, FileKind::Word, FileKind::Excel, FileKind::Text];
+    pub const DEFAULT: [FileKind; 8] = [
+        FileKind::Pdf,
+        FileKind::Image,
+        FileKind::Word,
+        FileKind::Excel,
+        FileKind::Presentation,
+        FileKind::Official,
+        FileKind::Email,
+        FileKind::Text,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -34,6 +58,9 @@ impl FileKind {
             FileKind::Excel => "excel",
             FileKind::Text => "text",
             FileKind::Log => "log",
+            FileKind::Presentation => "presentation",
+            FileKind::Email => "email",
+            FileKind::Official => "official",
         }
     }
 
@@ -45,20 +72,26 @@ impl FileKind {
             "excel" => Some(FileKind::Excel),
             "text" => Some(FileKind::Text),
             "log" => Some(FileKind::Log),
+            "presentation" => Some(FileKind::Presentation),
+            "email" => Some(FileKind::Email),
+            "official" => Some(FileKind::Official),
             _ => None,
         }
     }
 
-    /// Supported extensions; legacy binary .doc/.xls are deliberately excluded
+    /// Supported extensions; legacy binary .doc/.ppt are deliberately excluded
     /// (no reliable pure-Rust extractor) and are reported as unsupported.
     pub fn from_path(path: &std::path::Path) -> Option<Self> {
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();
         match ext.as_str() {
             "pdf" => Some(FileKind::Pdf),
             "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" => Some(FileKind::Image),
-            "docx" => Some(FileKind::Word),
-            "xlsx" | "xlsm" => Some(FileKind::Excel),
-            "txt" | "csv" | "md" | "json" | "xml" => Some(FileKind::Text),
+            "docx" | "odt" | "rtf" => Some(FileKind::Word),
+            "xlsx" | "xlsm" | "xls" | "ods" => Some(FileKind::Excel),
+            "pptx" | "odp" => Some(FileKind::Presentation),
+            "udf" | "eyp" => Some(FileKind::Official),
+            "eml" => Some(FileKind::Email),
+            "txt" | "csv" | "md" | "json" | "xml" | "html" | "htm" => Some(FileKind::Text),
             "log" => Some(FileKind::Log),
             _ => None,
         }
@@ -170,6 +203,25 @@ mod tests {
         assert_eq!(kind("app.log"), Some(FileKind::Log));
         assert_eq!(kind("APP.LOG"), Some(FileKind::Log));
         assert_eq!(kind("x.doc"), None);
+        assert_eq!(kind("x.ppt"), None);
+        for (name, expected) in [
+            ("a.odt", FileKind::Word),
+            ("a.RTF", FileKind::Word),
+            ("a.xls", FileKind::Excel),
+            ("a.ods", FileKind::Excel),
+            ("a.pptx", FileKind::Presentation),
+            ("a.odp", FileKind::Presentation),
+            ("a.udf", FileKind::Official),
+            ("a.EYP", FileKind::Official),
+            ("a.eml", FileKind::Email),
+            ("a.html", FileKind::Text),
+            ("a.htm", FileKind::Text),
+        ] {
+            assert_eq!(kind(name), Some(expected), "{name}");
+        }
+        for k in FileKind::ALL {
+            assert_eq!(FileKind::parse(k.as_str()), Some(k));
+        }
         assert_eq!(FileKind::parse("log"), Some(FileKind::Log));
         assert_eq!(FileKind::Log.as_str(), "log");
         assert!(!FileKind::DEFAULT.contains(&FileKind::Log), "logs are opt-in");

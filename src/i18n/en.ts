@@ -56,14 +56,29 @@ export const en: Strings = {
     allKinds: "All",
     date: "Date",
     dateOptions: { all: "Any time", week: "Last 7 days", month: "Last 30 days", year: "This year" },
+    size: "Size",
+    sizeOptions: { all: "Any size", small: "Under 1 MB", medium: "1–10 MB", large: "Over 10 MB" },
   },
-  kind: { pdf: "PDF", image: "Image", word: "Word", excel: "Excel", text: "Text", log: "Log" } satisfies Record<FileKind, string>,
+  kind: {
+    pdf: "PDF",
+    image: "Image",
+    word: "Word",
+    excel: "Excel",
+    presentation: "Presentation",
+    official: "Official (UDF/EYP)",
+    email: "Email",
+    text: "Text",
+    log: "Log",
+  } satisfies Record<FileKind, string>,
   kindFiles: {
     pdf: ".pdf",
     image: ".jpg .png .tif .bmp",
-    word: ".docx",
-    excel: ".xlsx .xlsm",
-    text: ".txt .csv .md .json .xml",
+    word: ".docx .odt .rtf",
+    excel: ".xlsx .xlsm .xls .ods",
+    presentation: ".pptx .odp",
+    official: ".udf (UYAP) .eyp (e-Yazışma)",
+    email: ".eml (with attachments)",
+    text: ".txt .csv .md .json .xml .html",
     log: ".log (can be large)",
   } satisfies Record<FileKind, string>,
   kinds: {
@@ -81,6 +96,71 @@ export const en: Strings = {
     summary: (labels: string[]) => labels.join(", "),
     removeWarning: (labels: string[]) =>
       `${labels.join(", ")} files will be removed from this folder's search (your files are not deleted).`,
+  },
+  help: {
+    button: "How to search",
+    open: "All search methods",
+    title: "How to search",
+    lead: "Click an example to put it in the search box and see its results.",
+    tryIt: "Try this search",
+    close: "Close",
+    note: "AND, OR, NOT and NEAR are written in capitals; a lowercase \"and\" is an ordinary word. Use the options above the results for file type, date and size.",
+    sections: [
+      {
+        title: "Basic search",
+        items: [
+          { example: "invoices", text: "Singular or plural, with or without Turkish letters." },
+          { example: "lease agreement", text: "Several words: documents containing all of them come first." },
+          { example: "\"lease agreement\"", text: "In quotes: the words in this order, side by side." },
+          { example: "2024/1548", text: "Search file numbers, plates and amounts exactly as written." },
+        ],
+      },
+      {
+        title: "Include, exclude",
+        items: [
+          { example: "lease AND deposit", text: "Both words must be in the document." },
+          { example: "+deposit lease", text: "A word with a plus must be there." },
+          { example: "invoice OR receipt", text: "Either word is enough." },
+          { example: "lease -deposit", text: "Documents containing a minus word never show." },
+          { example: "lease NOT deposit", text: "Same as the minus: documents with deposit are left out." },
+        ],
+      },
+      {
+        title: "Nearby words and completion",
+        items: [
+          { example: "lease NEAR/5 rent", text: "At most 5 words between the two, in either order." },
+          { example: "contract*", text: "Star: contract, contracts, contractor… all of them." },
+          { example: "colo?r", text: "A question mark stands for one letter." },
+        ],
+      },
+      {
+        title: "Similar spelling and synonyms",
+        items: [
+          { example: "rent~", text: "Also finds words one letter off, short words too (typos, scanning errors)." },
+          { example: "accounting~2", text: "Up to two letters off; searches wider." },
+          { example: "invoice&", text: "Counts the word's synonyms (receipt) as much as the word." },
+        ],
+      },
+    ],
+  },
+  schedule: {
+    edit: "Updates",
+    title: "When should this folder be updated?",
+    live: "Instantly",
+    liveHelp: "Changes in the folder are watched and reach the index right away.",
+    timed: "On a schedule",
+    timedHelp: "New and changed files are read only on the days and hours you choose, so the computer stays free during the day.",
+    days: "Days",
+    everyDay: "Every day",
+    dayNames: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+    dayLong: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+    from: "From",
+    to: "Until",
+    overnight: "Ends the next day",
+    note: "Runs while Zoria Arşiv is open. When the time is up the scan stops; the remaining files are read next time. \"Rescan\" updates the folder whenever you like.",
+    summaryLive: "Updated instantly",
+    summaryTimed: (days: string, from: string, to: string, overnight: boolean) =>
+      `On a schedule: ${days}, ${from}–${to}${overnight ? " (next day)" : ""}`,
   },
   source: {
     text_layer: "Text layer",
@@ -115,7 +195,7 @@ export const en: Strings = {
   },
   folders: {
     title: "Folders",
-    lead: "Manage the folders to search. Changes in these folders are watched and reach the index automatically.",
+    lead: "Manage the folders to search. Changes in these folders are watched, or picked up at the hours you choose, and reach the index automatically.",
     empty: "No folders added yet.",
     columns: { folder: "Folder", files: "Files", status: "Status", lastScan: "Last scan", kinds: "File types" },
     healthy: "No problems",
@@ -205,7 +285,7 @@ export const en: Strings = {
     lead: "Search the documents on your computer by what is written in them. Everything, scanned papers included, is read on this computer.",
     steps: [
       { title: "Choose a folder", body: "Pick the folder that holds your documents. Its subfolders are included." },
-      { title: "Choose file types", body: "Decide which PDF, Word, Excel, image and text files are read." },
+      { title: "Choose file types", body: "Decide which PDF, Word, Excel, presentation, UDF/EYP, email, image and text files are read." },
       { title: "Start searching", body: "Reading continues in the background; search as soon as the first documents are ready." },
     ],
     action: "Add your first folder",
@@ -264,7 +344,7 @@ export const en: Strings = {
   empty: {
     firstTitle: "Add a folder to your archive",
     firstBody:
-      "Zoria Arşiv reads and indexes the PDF, scanned image, Word, Excel and text files in the folders you choose, on this computer. No file is sent to the internet.",
+      "Zoria Arşiv reads and indexes the PDF, scanned image, Word, Excel, presentation, UYAP (UDF), e-Yazışma (EYP), email and text files in the folders you choose, on this computer. No file is sent to the internet.",
     readyTitle: "Ready to search",
     readyBody: (n: number) => `${n} documents indexed. Type a word, a name, an amount or a document number.`,
     tips: [
@@ -292,6 +372,7 @@ export const en: Strings = {
     folder_duplicate: "This folder is already in the archive.",
     folder_nested: "This folder is inside, or contains, another folder in the archive.",
     kinds_empty: "Choose at least one file type.",
+    schedule_invalid: "Choose at least one day, with different start and end times.",
     file_missing: "The file can no longer be found; it may have been moved or deleted.",
     not_indexed: "This file has not been indexed yet.",
     index_busy: "The index is busy right now. Try again in a moment.",

@@ -360,7 +360,7 @@ mod tests {
         PageHit { path: path.into(), page, score }
     }
     fn filter() -> SearchFilter<'static> {
-        SearchFilter { kinds: &[], modified_after: None, modified_before: None }
+        SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] }
     }
 
     fn options() -> HybridOptions {
@@ -467,7 +467,7 @@ mod tests {
         index.set("/a.pdf", FileKind::Pdf, 100, &[(0, vec![1.0, 0.0])]);
         index.set("/b.docx", FileKind::Word, 100, &[(1, vec![0.0, 1.0])]);
         index.set("/old.pdf", FileKind::Pdf, 10, &[(0, vec![1.0, 0.0])]);
-        let filter = SearchFilter { kinds: &[FileKind::Pdf], modified_after: Some(50), modified_before: None };
+        let filter = SearchFilter { kinds: &[FileKind::Pdf], modified_after: Some(50), modified_before: None, extra: &[] };
         let hits = index.search(&[1.0, 0.0], &filter, &options());
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "/a.pdf");

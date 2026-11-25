@@ -8,5 +8,7 @@ pub mod extract;
 pub mod index;
 pub mod model;
 pub mod ocr;
+pub mod query;
+pub mod schedule;
 pub mod turkish;
 pub mod vectors;

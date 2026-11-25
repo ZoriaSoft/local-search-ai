@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0 — 2026-11-25
+
+- More file types: PowerPoint and OpenDocument presentations, OpenDocument
+  text and spreadsheets, RTF, legacy Excel (.xls), HTML, e-mail (.eml) with
+  its attachments, and Turkish official documents (UYAP .udf, e-Yazışma
+  .eyp; for an encrypted .eyp only its metadata is searchable).
+- Timed folder updates: a folder can be indexed only on chosen days and
+  hours. Work stops when the window ends and continues in the next one.
+- Search operators: required (+, AND/VE), excluded (-, NOT/DEĞİL), OR/VEYA,
+  nearby words (NEAR/5, YAKIN/5), wildcards (* and ?), similar spelling
+  (word~, word~2) and full-weight synonyms (word&).
+- Size filter next to the date filter.
+- A "How to search" guide with examples that run on a click.
+
 ## 0.3.1 — 2026-11-25
 
 - The installer now works without an internet connection: the Microsoft

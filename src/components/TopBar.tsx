@@ -11,10 +11,11 @@ interface Props {
   progress: IndexProgress;
   disabled: boolean; // first run: nothing to search yet
   onActivity: () => void;
+  onHelp: () => void;
 }
 
 /** Product bar: brand, the one search box, and what the indexer is doing. */
-export function TopBar({ inputRef, query, onQuery, progress, disabled, onActivity }: Props) {
+export function TopBar({ inputRef, query, onQuery, progress, disabled, onActivity, onHelp }: Props) {
   const busy = progress.phase !== "idle";
   const done = Math.max(progress.textDone ?? 0, progress.done);
   const label = !busy
@@ -60,6 +61,9 @@ export function TopBar({ inputRef, query, onQuery, progress, disabled, onActivit
           </kbd>
         )}
       </div>
+      <button className="help-btn" onClick={onHelp} disabled={disabled} title={t.help.title}>
+        <span aria-hidden="true">?</span> {t.help.button}
+      </button>
       <button
         className={`activity${busy ? " busy" : ""}`}
         onClick={onActivity}

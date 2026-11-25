@@ -93,16 +93,18 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "arsiv-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "aho-corasick",
  "anyhow",
  "base64 0.22.1",
  "blake3",
  "calamine",
+ "chrono",
  "encoding_rs",
  "image",
  "lru",
+ "mail-parser",
  "notify",
  "notify-debouncer-full",
  "ort",
@@ -125,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "arsiv-eval"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arsiv-core",
@@ -1937,6 +1939,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashify"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd1246c0e5493286aeb2dde35b1f4eb9c4ce00e628641210a5e553fc001a1f26"
+dependencies = [
+ "indexmap 2.14.2",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "hashlink"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2720,6 +2734,15 @@ name = "macro_rules_attribute-proc_macro"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
+
+[[package]]
+name = "mail-parser"
+version = "0.11.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ec00bda90c6e645a54506c630c2820cd6b1890cfd2b0a169b50f74b2b8c7c86"
+dependencies = [
+ "hashify",
+]
 
 [[package]]
 name = "markup5ever"
@@ -6873,7 +6896,7 @@ dependencies = [
 
 [[package]]
 name = "zoria-arsiv"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arsiv-core",

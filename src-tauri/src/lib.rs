@@ -13,6 +13,7 @@ use arsiv_core::engine::{
     SearchResponse,
 };
 use arsiv_core::model::FileKind;
+use arsiv_core::schedule::FolderSchedule;
 use arsiv_core::ocr::OcrConfig;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -144,6 +145,16 @@ async fn set_folder_kinds(id: i64, kinds: Vec<String>, state: State<'_, AppState
     blocking(&state, move |engine| engine.set_folder_kinds(id, &kinds)).await
 }
 
+/// Timed updates for a folder; `null` returns it to live watching.
+#[tauri::command]
+async fn set_folder_schedule(
+    id: i64,
+    schedule: Option<FolderSchedule>,
+    state: State<'_, AppState>,
+) -> Result<FolderInfo, ApiError> {
+    blocking(&state, move |engine| engine.set_folder_schedule(id, schedule)).await
+}
+
 /// Returns at once; the run winds down in the background and reports
 /// through `index://progress` (`cancelling`, then `cancelled`).
 #[tauri::command]
@@ -203,6 +214,8 @@ async fn search(request: SearchRequestInput, state: State<'_, AppState>) -> Resu
         kinds: request.kinds.into_iter().filter_map(|k| FileKind::parse(&k)).collect(),
         modified_after: request.modified_after,
         modified_before: request.modified_before,
+        min_size: request.min_size,
+        max_size: request.max_size,
         limit: request.limit,
         offset: request.offset,
     };
@@ -218,6 +231,10 @@ struct SearchRequestInput {
     modified_before: Option<i64>,
     limit: usize,
     offset: usize,
+    #[serde(default)]
+    min_size: Option<i64>,
+    #[serde(default)]
+    max_size: Option<i64>,
 }
 
 #[tauri::command]
@@ -450,6 +467,7 @@ pub fn run() {
                     let _ = changed_handle.emit("index://changed", serde_json::json!({ "documentCount": count }));
                 }),
             )?;
+            engine.start_scheduler()?;
             app.manage(AppState { engine, version: env!("CARGO_PKG_VERSION") });
             Ok(())
         })
@@ -458,6 +476,7 @@ pub fn run() {
             list_folders,
             add_folder,
             set_folder_kinds,
+            set_folder_schedule,
             cancel_indexing,
             remove_folder,
             reindex,

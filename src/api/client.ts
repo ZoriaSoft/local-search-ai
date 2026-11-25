@@ -15,6 +15,7 @@ import type {
   FailureInfo,
   FileKind,
   FolderInfo,
+  FolderSchedule,
   IndexProgress,
   LegalTexts,
   OcrLanguageInfo,
@@ -29,6 +30,7 @@ export interface Backend {
   listFolders(): Promise<FolderInfo[]>;
   addFolder(path: string, kinds: FileKind[]): Promise<FolderInfo>;
   setFolderKinds(id: number, kinds: FileKind[]): Promise<FolderInfo>;
+  setFolderSchedule(id: number, schedule: FolderSchedule | null): Promise<FolderInfo>;
   cancelIndexing(): Promise<boolean>;
   removeFolder(id: number): Promise<void>;
   reindex(folderId: number | null): Promise<void>;
@@ -100,6 +102,7 @@ function tauriBackend(): Backend {
     listFolders: () => call("list_folders"),
     addFolder: (path, kinds) => call("add_folder", { path, kinds }),
     setFolderKinds: (id, kinds) => call("set_folder_kinds", { id, kinds }),
+    setFolderSchedule: (id, schedule) => call("set_folder_schedule", { id, schedule }),
     cancelIndexing: () => call("cancel_indexing"),
     removeFolder: (id) => call("remove_folder", { id }),
     reindex: (folderId) => call("reindex", { folderId }),

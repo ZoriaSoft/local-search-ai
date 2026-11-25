@@ -718,7 +718,7 @@ fn main() -> Result<()> {
 }
 
 fn request(query: &str, limit: usize) -> SearchRequest {
-    SearchRequest { query: query.into(), kinds: vec![], modified_after: None, modified_before: None, limit, offset: 0 }
+    SearchRequest { query: query.into(), kinds: vec![], modified_after: None, modified_before: None, min_size: None, max_size: None, limit, offset: 0 }
 }
 
 #[derive(Deserialize)]

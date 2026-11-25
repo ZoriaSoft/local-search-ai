@@ -29,7 +29,7 @@ fn engine(data: &Path) -> Arc<Engine> {
 }
 
 fn request(query: &str) -> SearchRequest {
-    SearchRequest { query: query.into(), kinds: vec![], modified_after: None, modified_before: None, limit: 20, offset: 0 }
+    SearchRequest { query: query.into(), kinds: vec![], modified_after: None, modified_before: None, min_size: None, max_size: None, limit: 20, offset: 0 }
 }
 
 #[test]

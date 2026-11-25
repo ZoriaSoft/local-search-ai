@@ -8,7 +8,8 @@ import { AboutView } from "./components/AboutView";
 import { FoldersView } from "./components/FoldersView";
 import { IssuesView } from "./components/IssuesView";
 import { NavRail, type View } from "./components/NavRail";
-import { SearchView, type DateRange } from "./components/SearchView";
+import { SearchHelp } from "./components/SearchHelp";
+import { SearchView, type DateRange, type SizeRange } from "./components/SearchView";
 import { SettingsView } from "./components/SettingsView";
 import { TopBar } from "./components/TopBar";
 import { Welcome } from "./components/Welcome";
@@ -21,6 +22,14 @@ const IDLE: IndexProgress = {
   phase: "idle", total: 0, done: 0, failed: 0, current: null, startedAt: null, finishedAt: null, watching: false,
   cancelling: false, cancelled: false, textDone: 0, embedDone: 0, embedTotal: 0, unread: 0, pendingEmbed: null,
 };
+
+const MB = 1024 * 1024;
+function sizeBounds(size: SizeRange): { minSize: number | null; maxSize: number | null } {
+  if (size === "small") return { minSize: null, maxSize: MB - 1 };
+  if (size === "medium") return { minSize: MB, maxSize: 10 * MB };
+  if (size === "large") return { minSize: 10 * MB + 1, maxSize: null };
+  return { minSize: null, maxSize: null };
+}
 
 function rangeStart(range: DateRange): number | null {
   const now = new Date();
@@ -48,6 +57,8 @@ export function App({ initialView = "search", onLanguage }: AppProps) {
   const [submitted, setSubmitted] = useState("");
   const [kinds, setKinds] = useState<FileKind[]>([]);
   const [range, setRange] = useState<DateRange>("all");
+  const [size, setSize] = useState<SizeRange>("all");
+  const [helpOpen, setHelpOpen] = useState(false);
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [total, setTotal] = useState(0);
   const [tookMs, setTookMs] = useState(0);
@@ -99,7 +110,7 @@ export function App({ initialView = "search", onLanguage }: AppProps) {
       setLoading(true);
       try {
         const response = await backend.search({
-          query: text, kinds, modifiedAfter: rangeStart(range), modifiedBefore: null, limit: PAGE, offset,
+          query: text, kinds, modifiedAfter: rangeStart(range), modifiedBefore: null, ...sizeBounds(size), limit: PAGE, offset,
         });
         if (id !== searchId.current || !indexRevision.isCurrent()) return;
         setError(null);
@@ -124,7 +135,7 @@ export function App({ initialView = "search", onLanguage }: AppProps) {
         if (id === searchId.current && indexRevision.isCurrent()) setLoading(false);
       }
     },
-    [backend, kinds, range, indexRevision],
+    [backend, kinds, range, size, indexRevision],
   );
 
   useEffect(() => {
@@ -355,6 +366,9 @@ export function App({ initialView = "search", onLanguage }: AppProps) {
         onKinds={setKinds}
         range={range}
         onRange={setRange}
+        size={size}
+        onSize={setSize}
+        onHelp={() => setHelpOpen(true)}
         hits={hits}
         total={total}
         tookMs={tookMs}
@@ -381,6 +395,7 @@ export function App({ initialView = "search", onLanguage }: AppProps) {
         progress={progress}
         disabled={firstRun}
         onActivity={() => setView("folders")}
+        onHelp={() => setHelpOpen(true)}
       />
       <div className="body">
         <NavRail
@@ -437,6 +452,16 @@ export function App({ initialView = "search", onLanguage }: AppProps) {
           paths={pendingFolders}
           onConfirm={(kinds) => void addFolders(pendingFolders, kinds)}
           onCancel={() => setPendingFolders(null)}
+        />
+      )}
+      {helpOpen && (
+        <SearchHelp
+          onTry={(example) => {
+            setHelpOpen(false);
+            onQuery(example);
+            input.current?.focus();
+          }}
+          onClose={() => setHelpOpen(false)}
         />
       )}
       <div className="sr-only" aria-live="polite">

@@ -30,6 +30,7 @@ use crate::model::{ExtractedDocument, FileKind};
 
 /// How long `SearchIndex::writer` waits out a transiently held writer lock.
 const WRITER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+use crate::query::{ExtraTerm, QueryConstraints};
 use crate::turkish::{ascii_fold, token_spans, tokenize, turkish_lower};
 
 /// Bump whenever the schema or tokenization changes. An index written by
@@ -512,6 +513,8 @@ pub struct SearchFilter<'a> {
     pub kinds: &'a [FileKind],
     pub modified_after: Option<i64>,
     pub modified_before: Option<i64>,
+    /// Operator terms that widen the match (`word~`, `word&`).
+    pub extra: &'a [ExtraTerm],
 }
 
 impl SearchIndex {
@@ -753,6 +756,29 @@ impl SearchIndex {
                 }
             }
         }
+        for extra in filter.extra {
+            match extra {
+                ExtraTerm::Fuzzy(word, distance) => {
+                    for term in Self::part_terms(word) {
+                        clauses.push((
+                            Occur::Should,
+                            Box::new(FuzzyTermQuery::new(
+                                Term::from_field_text(self.fields.folded, &term),
+                                (*distance).clamp(1, 2),
+                                true,
+                            )),
+                        ));
+                    }
+                }
+                ExtraTerm::Synonyms(word) => {
+                    for term in Self::part_terms(word) {
+                        for synonym in synonyms_of(&term) {
+                            clauses.push((Occur::Should, self.word_forms(&folded_term(&turkish_lower(&synonym)))));
+                        }
+                    }
+                }
+            }
+        }
         let sequence = folded_sequence(query);
         let mut proximity: Vec<(&[String], f32)> = Vec::new();
         if options.phrase_boost > 0.0 && sequence.len() >= 2 {
@@ -809,6 +835,92 @@ impl SearchIndex {
             ));
         }
         Some(BooleanQuery::new(must))
+    }
+
+    /// One required/excluded part (a word with its inflections, or an exact
+    /// phrase) as a query on the folded field.
+    fn part_query(&self, part: &str) -> Option<Box<dyn Query>> {
+        let mut terms = Self::part_terms(part);
+        match terms.len() {
+            0 => None,
+            1 => Some(self.word_forms(&terms.remove(0))),
+            _ => Some(Box::new(PhraseQuery::new(terms.iter().map(|t| Term::from_field_text(self.fields.folded, t)).collect()))),
+        }
+    }
+
+    fn part_terms(part: &str) -> Vec<String> {
+        tokenize(part).into_iter().map(|(s, e)| folded_term(&turkish_lower(&part[s..e]))).filter(|t| !t.is_empty()).collect()
+    }
+
+    /// `kir*`, `dilek?e` as a regex over folded words.
+    fn wildcard_query(&self, pattern: &str) -> Option<Box<dyn Query>> {
+        let mut regex = String::new();
+        let mut literal = String::new();
+        let flush = |literal: &mut String, regex: &mut String| {
+            if !literal.is_empty() {
+                regex.push_str(&regex_syntax_escape(&folded_term(&turkish_lower(literal))));
+                literal.clear();
+            }
+        };
+        for ch in pattern.chars() {
+            match ch {
+                '*' => {
+                    flush(&mut literal, &mut regex);
+                    regex.push_str(".*");
+                }
+                '?' => {
+                    flush(&mut literal, &mut regex);
+                    regex.push('.');
+                }
+                c if c.is_alphanumeric() => literal.push(c),
+                _ => {}
+            }
+        }
+        flush(&mut literal, &mut regex);
+        RegexQuery::from_pattern(&regex, self.fields.folded).ok().map(|q| Box::new(q) as Box<dyn Query>)
+    }
+
+    /// Document-level operator constraints (`crate::query`): the files every
+    /// positive constraint allows (`None` when there is none) and the files
+    /// an excluded part rules out. A file is one or more page documents, so
+    /// "must not contain" holds for the whole file, as in dtSearch.
+    pub fn constraint_paths(&self, constraints: &QueryConstraints) -> Result<(Option<HashSet<String>>, HashSet<String>)> {
+        let searcher = self.reader.searcher();
+        let mut allowed: Option<HashSet<String>> = None;
+        let mut positive: Vec<Option<Box<dyn Query>>> = Vec::new();
+        positive.extend(constraints.required.iter().map(|part| self.part_query(part)));
+        positive.extend(constraints.wildcards.iter().map(|pattern| self.wildcard_query(pattern)));
+        for (left, right, distance) in &constraints.near {
+            let (a, b) = (Self::part_terms(left), Self::part_terms(right));
+            if a.is_empty() || b.is_empty() {
+                continue;
+            }
+            let slop = distance.saturating_sub(1) + (a.len() + b.len()).saturating_sub(2) as u32;
+            let phrase = |first: &[String], second: &[String]| -> Box<dyn Query> {
+                let terms = first.iter().chain(second).map(|t| Term::from_field_text(self.fields.folded, t)).collect();
+                let mut query = PhraseQuery::new(terms);
+                query.set_slop(slop);
+                Box::new(query)
+            };
+            positive.push(Some(Box::new(BooleanQuery::new(vec![(Occur::Should, phrase(&a, &b)), (Occur::Should, phrase(&b, &a))]))));
+        }
+        for query in positive {
+            let found = match query {
+                Some(query) => searcher.search(&query, &DistinctPaths)?,
+                None => HashSet::new(),
+            };
+            allowed = Some(match allowed.take() {
+                Some(current) => current.intersection(&found).cloned().collect(),
+                None => found,
+            });
+        }
+        let mut ruled_out = HashSet::new();
+        for part in &constraints.excluded {
+            if let Some(query) = self.part_query(part) {
+                ruled_out.extend(searcher.search(&query, &DistinctPaths)?);
+            }
+        }
+        Ok((allowed, ruled_out))
     }
 
     /// Exact distinct-file count with the same query semantics as search.
@@ -1422,7 +1534,7 @@ mod tests {
         index.add(&writer, "b.pdf", 10, &document("Isparta dışında ilgisiz metin")).unwrap();
         writer.commit().unwrap();
         index.reload().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         for query in ["sözleşmesi", "SOZLESMESI", "Sözleşmesi"] {
             let hits = index.search(query, &filter, 10).unwrap();
             assert_eq!(hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(), ["a.pdf"], "{query}");
@@ -1453,7 +1565,7 @@ mod tests {
         index.add(&writer, "other.pdf", 10, &document("Unrelated meeting notes")).unwrap();
         writer.commit().unwrap();
         index.reload().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         for (query, first) in [("invoices", "plural.pdf"), ("companies", "plural.pdf"), ("approved", "plural.pdf"), ("processing", "base.pdf")] {
             let hits: Vec<String> = index.search(query, &filter, 10).unwrap().into_iter().map(|h| h.path).collect();
             assert_eq!(hits.first().map(String::as_str), Some(first), "{query}: {hits:?}");
@@ -1476,7 +1588,7 @@ mod tests {
         index.add(&writer, "a.pdf", 2, &document("yeni kalem")).unwrap();
         writer.commit().unwrap();
         index.reload().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         assert!(index.search("tablo", &filter, 10).unwrap().is_empty());
         assert_eq!(index.search("kalem", &filter, 10).unwrap().len(), 1);
     }
@@ -1733,7 +1845,7 @@ mod tests {
         index.add(&writer, "c.pdf", 10, &document("Kiraz mevsimi geldi")).unwrap();
         writer.commit().unwrap();
         index.reload().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
 
         // Query-side stem + prefix: "sözleşmesi" must reach "sözleşmenin" too.
         let hits = index.search("sözleşmesi", &filter, 10).unwrap();
@@ -1786,7 +1898,7 @@ mod tests {
         index.add(&writer, "whole.pdf", 10, &document("Tutar 9.731,45 net ödenir")).unwrap();
         writer.commit().unwrap();
         index.reload().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         // Amount: adjacent hits; pieces scattered over one page do not match.
         // `TL` is not required (documents still rank without it).
         let hits = index.search("8.158,00 TL", &filter, 10).unwrap();
@@ -1815,7 +1927,7 @@ mod tests {
         index.add(&writer, "half.pdf", 10, &document("TEST 123 otobüsü geçti")).unwrap();
         writer.commit().unwrap();
         index.reload().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         let hits = index.search("00 TEST 123", &filter, 10).unwrap();
         let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
         assert_eq!(paths, ["plate.pdf", "no-code.pdf"], "TEST optional, 00 and 123 required");
@@ -1837,13 +1949,13 @@ mod tests {
         index.add(&writer, "f0.pdf", 11, &multi_page(&["fatura yeni"])).unwrap();
         writer.commit().unwrap();
         index.reload().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         let result = index.search_counted("fatura", &filter, 5).unwrap();
         assert_eq!(result.hits.len(), 5);
         assert_eq!(result.total_files, 40);
         assert_eq!(index.count_files("fatura", &filter).unwrap(), result.total_files);
         let word = [FileKind::Word];
-        let filtered = SearchFilter { kinds: &word, modified_after: None, modified_before: None };
+        let filtered = SearchFilter { kinds: &word, modified_after: None, modified_before: None, extra: &[] };
         assert_eq!(index.search_counted("fatura", &filtered, 5).unwrap().total_files, 0);
     }
 
@@ -1871,13 +1983,13 @@ mod tests {
         let pdf = [FileKind::Pdf];
         let word = [FileKind::Word];
         let filters = [
-            SearchFilter { kinds: &[], modified_after: None, modified_before: None },
-            SearchFilter { kinds: &pdf, modified_after: None, modified_before: None },
-            SearchFilter { kinds: &word, modified_after: None, modified_before: None },
-            SearchFilter { kinds: &[], modified_after: Some(20), modified_before: Some(30) },
-            SearchFilter { kinds: &pdf, modified_after: Some(20), modified_before: Some(20) },
-            SearchFilter { kinds: &[], modified_after: Some(50), modified_before: None },
-            SearchFilter { kinds: &[], modified_after: None, modified_before: Some(10) },
+            SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] },
+            SearchFilter { kinds: &pdf, modified_after: None, modified_before: None, extra: &[] },
+            SearchFilter { kinds: &word, modified_after: None, modified_before: None, extra: &[] },
+            SearchFilter { kinds: &[], modified_after: Some(20), modified_before: Some(30), extra: &[] },
+            SearchFilter { kinds: &pdf, modified_after: Some(20), modified_before: Some(20), extra: &[] },
+            SearchFilter { kinds: &[], modified_after: Some(50), modified_before: None, extra: &[] },
+            SearchFilter { kinds: &[], modified_after: None, modified_before: Some(10), extra: &[] },
         ];
         let literal = SearchOptions { expand: false, stem_boost: 0.0, synonym_boost: 0.0, ..SearchOptions::default() };
         for options in [
@@ -1914,7 +2026,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let index = SearchIndex::open(dir.path()).unwrap();
         let mut writer = index.writer().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         let verify = |expected| {
             assert_eq!(index.count_files("kalem", &filter).unwrap(), expected);
             assert_eq!(index.search_counted("kalem", &filter, 1).unwrap().total_files, expected);
@@ -2004,7 +2116,7 @@ mod tests {
         index.add(&writer, "b.pdf", 10, &document("İlgisiz metin")).unwrap();
         writer.commit().unwrap();
         index.reload().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         let stems_only = SearchOptions { expand: false, legacy_stems: false, stem_boost: 0.5, ..SearchOptions::default() };
         index.set_options(SearchOptions { stem_boost: 0.0, ..stems_only });
         assert!(index.search("sözleşmeler", &filter, 10).unwrap().is_empty());
@@ -2033,7 +2145,7 @@ mod tests {
         index.add(&writer, "near.pdf", 10, &document("Bu kira sözleşmesi bir yıllıktır ve uzun bir metnin parçasıdır burada")).unwrap();
         writer.commit().unwrap();
         index.reload().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         let ranked = |q: &str| index.search(q, &filter, 10).unwrap().into_iter().map(|h| h.path).collect::<Vec<_>>();
 
         assert_eq!(ranked("\"kira sözleşmesi\""), ["near.pdf"]);
@@ -2056,7 +2168,7 @@ mod tests {
         index.add(&writer, "near.pdf", 10, &document("yeni kira sözleşmesi imzalandı ve bir yıl uzun sürdü")).unwrap();
         writer.commit().unwrap();
         index.reload().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         let top = |options: SearchOptions| {
             index.set_options(options);
             index.search("yıl kira sözleşmesi uzun", &filter, 10).unwrap()[0].path.clone()
@@ -2091,7 +2203,7 @@ mod tests {
         index.add(&writer, "fatura.pdf", 10, &document("Fatura ektedir")).unwrap();
         writer.commit().unwrap();
         index.reload().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         let ranked = |q: &str| index.search(q, &filter, 10).unwrap().into_iter().map(|h| h.path).collect::<Vec<_>>();
         index.set_options(SearchOptions { synonym_boost: 0.0, ..SearchOptions::default() });
         assert_eq!(ranked("fatura"), ["fatura.pdf"]);
@@ -2111,7 +2223,7 @@ mod tests {
         index.add(&writer, "a.pdf", 10, &document("Sözleşme Ankara'da imzalandı")).unwrap();
         writer.commit().unwrap();
         index.reload().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         let hits = index.search("ankarada", &filter, 10).unwrap();
         assert_eq!(hits.len(), 1, "apostrophe fold failed: {hits:?}");
     }
@@ -2130,7 +2242,7 @@ mod tests {
         index.add(&writer, "separated.pdf", 10, &document("ÜCRET başka İSTANBUL")).unwrap();
         writer.commit().unwrap();
         index.reload().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         for query in ["\"ücret istanbul\"", "“U\u{308}CRET I\u{307}STANBUL”"] {
             let mut paths: Vec<_> = index.search(query, &filter, 10).unwrap().into_iter().map(|h| h.path).collect();
             paths.sort();
@@ -2163,7 +2275,7 @@ mod tests {
         index.add(&writer, "two-edits.pdf", 1, &document("zaxbeklm")).unwrap();
         writer.commit().unwrap();
         index.reload().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         let hits = index.search("zavreklm", &filter, 100).unwrap();
         assert_eq!(hits.len(), variants.len(), "{hits:?}");
         assert!(hits.iter().all(|h| h.path != "two-edits.pdf"));
@@ -2228,7 +2340,7 @@ mod tests {
         }
         writer.commit().unwrap();
         index.reload().unwrap();
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         let complete = index.search_counted("zavreklm", &filter, usize::MAX).unwrap();
         assert_eq!(complete.hits.len(), 100);
         assert_eq!(complete.total_files, 100);

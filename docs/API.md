@@ -7,9 +7,12 @@ Timestamps are Unix seconds (UTC). Errors reject the `invoke` promise with `ApiE
 ## Types
 
 ```ts
-type FileKind = "pdf" | "image" | "word" | "excel" | "text" | "log";
-// pdf .pdf · image .jpg .jpeg .png .tif .tiff .bmp · word .docx · excel .xlsx .xlsm
-// text .txt .csv .md .json .xml · log .log (not in a new folder's default selection)
+type FileKind = "pdf" | "image" | "word" | "excel" | "presentation" | "official" | "email" | "text" | "log";
+// pdf .pdf · image .jpg .jpeg .png .tif .tiff .bmp · word .docx .odt .rtf · excel .xlsx .xlsm .xls .ods
+// presentation .pptx .odp (page = slide) · official .udf (UYAP) .eyp (e-Yazışma: page 1 metadata,
+// then cover letter and attachments; encrypted content = failed page) · email .eml (page 1 headers
+// and body, then attachments) · text .txt .csv .md .json .xml .html .htm
+// log .log (not in a new folder's default selection)
 
 interface ApiError { code: ErrorCode; message: string }   // message: English diagnostic
 type ErrorCode =
@@ -157,6 +160,7 @@ interface Notices {
 | `list_folders` | – | `FolderInfo[]` |
 | `add_folder` | `{ path: string, kinds?: FileKind[] }` | `FolderInfo` (starts indexing that folder; `kinds` omitted = all; `[]` → `kinds_empty`) |
 | `set_folder_kinds` | `{ id: number, kinds: FileKind[] }` | `FolderInfo` — stored per folder; records of unselected kinds are dropped, newly selected kinds are scanned; `[]` → `kinds_empty`, unknown id → `folder_missing` |
+| `set_folder_schedule` | `{ id: number, schedule: FolderSchedule \| null }` | `FolderInfo` — timed updates (see `FolderSchedule` in `src/api/types.ts`); `null` = watched live; invalid → `schedule_invalid` |
 | `cancel_indexing` | – | `boolean` — false when nothing was running; returns at once, outcome via `index://progress` |
 | `remove_folder` | `{ id: number }` | `void` (removes its documents from the index) |
 | `reindex` | `{ folderId: number \| null }` | `void` (rescan one or all; incremental by size+mtime) |
@@ -196,6 +200,11 @@ interface Notices {
   Filename matching folds apostrophes symmetrically; multipart numeric
   amounts/dates require adjacent numeric tokens, while single-number filename
   prefixes remain supported.
+- Operators (`crates/arsiv-core/src/query.rs`): `-w`/`DEĞİL`/`NOT` exclude files containing w, `+w`/`VE`/`AND`
+  require w, `a YAKIN/n b` (`w/n`, `NEAR/n`) needs both within n words on one page, `*`/`?` wildcards.
+  `w~`/`w~2` add fuzzy (edit distance 1/2) matches to the ranking; `w&` adds w's synonyms at full weight.
+  `SearchRequest.minSize/maxSize` (bytes, inclusive) keep files within the bounds.
+  Constraints apply to every result (BM25, vector-only, file-name); operators are capitals only.
 - BM25, configured semantic candidates and filename promotions form a stable
   union before pagination. `total` and ordering do not depend on `limit` or
   `offset`; the semantic candidate budget is fixed by `HybridOptions`, not

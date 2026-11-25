@@ -25,6 +25,7 @@ use crate::index::{
 };
 use crate::model::{is_low_confidence, ExtractedDocument, FileKind, TextSource};
 use crate::ocr::{is_cancelled, Cancelled, OcrConfig};
+use crate::schedule::{local_now, local_to_unix, FolderSchedule};
 use crate::vectors::{
     fuse, idf_coverage, is_code_query, short_text_adjusted, term_weights, FusedHit, HybridOptions, VectorIndex,
 };
@@ -216,6 +217,9 @@ pub struct SearchRequest {
     pub kinds: Vec<FileKind>,
     pub modified_after: Option<i64>,
     pub modified_before: Option<i64>,
+    /// File size bounds in bytes (inclusive); `None` = unbounded.
+    pub min_size: Option<i64>,
+    pub max_size: Option<i64>,
     pub limit: usize,
     pub offset: usize,
 }
@@ -313,6 +317,9 @@ pub struct EnginePaths {
 enum Job {
     Folder(i64),
     All,
+    /// Every folder without a schedule (start-up, resume after a removal):
+    /// timed folders are scanned only in their window or on request.
+    Live,
     Paths(Vec<PathBuf>),
     /// Drop a folder's records whose kind is no longer selected. Quick (no
     /// extraction) and never discarded by a cancel.
@@ -359,6 +366,17 @@ pub struct Engine {
     index_dir: PathBuf,
     ready: Arc<Ready>,
     page_images: Mutex<lru::LruCache<PageImageKey, Arc<PageImage>>>,
+    /// The timed run the scheduler started, until it ends or its window closes.
+    timed: Mutex<Option<TimedRun>>,
+}
+
+/// How often the scheduler looks at the clock.
+const SCHEDULE_TICK: Duration = Duration::from_secs(20);
+
+struct TimedRun {
+    ends_at: i64,
+    /// The run was seen in progress, so idle afterwards means it finished.
+    seen_running: bool,
 }
 
 /// Set once the start-up work (index rebuild, if any, and the initial rescan)
@@ -514,6 +532,7 @@ impl Engine {
             page_images: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(PAGE_IMAGE_CACHE).expect("non-zero cache"),
             )),
+            timed: Mutex::new(None),
         });
         let worker = Worker {
             catalog: engine.catalog.clone(),
@@ -534,6 +553,81 @@ impl Engine {
             .spawn(move || worker.run(receiver, rebuild, &ready))?;
         engine.restart_watcher()?;
         Ok(engine)
+    }
+
+    /// Starts the clock that runs timed folder updates (the app calls this
+    /// once after `open`; headless callers and tests scan on demand). The
+    /// thread ends after the engine is dropped.
+    pub fn start_scheduler(self: &Arc<Self>) -> Result<()> {
+        let scheduler = Arc::downgrade(self);
+        std::thread::Builder::new().name("arsiv-schedule".into()).spawn(move || loop {
+            std::thread::sleep(SCHEDULE_TICK);
+            let Some(engine) = scheduler.upgrade() else { break };
+            let _ = engine.schedule_tick(local_now(), now());
+        })?;
+        Ok(())
+    }
+
+    /// One look at the clock: stops the timed run whose window closed, or
+    /// starts the scan of one timed folder whose window is open and has not
+    /// run yet in this window. `local` is wall-clock time, `now` Unix seconds.
+    pub(crate) fn schedule_tick(&self, local: chrono::NaiveDateTime, now: i64) -> Result<()> {
+        let idle = self.progress.lock().phase == IndexPhase::Idle;
+        {
+            let mut timed = self.timed.lock();
+            if let Some(run) = timed.as_mut() {
+                if !idle {
+                    run.seen_running = true;
+                }
+                let closed = now >= run.ends_at;
+                if closed && !idle {
+                    *timed = None;
+                    drop(timed);
+                    self.cancel_indexing();
+                    return Ok(());
+                }
+                if !(closed || run.seen_running && idle) {
+                    return Ok(());
+                }
+                *timed = None;
+            }
+        }
+        let schedules = self.catalog.lock().folder_schedules()?;
+        for (id, schedule, last) in schedules {
+            let Some((start, end)) = schedule.window_at(local) else { continue };
+            if last >= local_to_unix(start) {
+                continue;
+            }
+            self.catalog.lock().set_schedule_last(id, now)?;
+            *self.timed.lock() = Some(TimedRun { ends_at: local_to_unix(end), seen_running: false });
+            self.jobs.send(Job::Folder(id)).map_err(|_| anyhow!("indexer stopped"))?;
+            break;
+        }
+        Ok(())
+    }
+
+    /// Timed updates for a folder (`None`: back to live watching, and a scan
+    /// now picks up what changed meanwhile). A timed folder is not watched.
+    pub fn set_folder_schedule(&self, id: i64, schedule: Option<FolderSchedule>) -> Result<FolderInfo> {
+        let schedule = match schedule {
+            Some(schedule) => {
+                let schedule = schedule.normalized();
+                schedule.validate().map_err(|message| EngineError::new("schedule_invalid", message))?;
+                Some(schedule)
+            }
+            None => None,
+        };
+        if !self.catalog.lock().set_folder_schedule(id, schedule.as_ref())? {
+            return Err(EngineError::new("folder_missing", format!("No folder with id {id}")));
+        }
+        self.restart_watcher()?;
+        if schedule.is_none() {
+            self.jobs.send(Job::Folder(id)).map_err(|_| anyhow!("indexer stopped"))?;
+        }
+        self.folders()?
+            .into_iter()
+            .find(|f| f.id == id)
+            .ok_or_else(|| anyhow!("folder vanished"))
     }
 
     pub fn ocr_status(&self) -> Result<String, String> {
@@ -766,7 +860,7 @@ impl Engine {
     }
 
     fn restart_watcher(&self) -> Result<()> {
-        let folders = self.catalog.lock().folder_ids()?;
+        let folders = self.catalog.lock().live_folder_ids()?;
         let jobs = self.jobs.clone();
         let mut slot = self.watcher.lock();
         *slot = None;
@@ -870,7 +964,13 @@ impl Engine {
             *slot = ms(now - stage);
             stage = now;
         };
-        if query_terms(&request.query).is_empty() {
+        // Operators (+/-, VE/VEYA/DEĞİL, YAKIN/n, wildcards) become
+        // file-level constraints; the rest ranks exactly like a plain query.
+        let parsed = crate::query::parse(&request.query);
+        let query: &str = &parsed.text;
+        let sized = request.min_size.is_some() || request.max_size.is_some();
+        let constrained = !parsed.constraints.is_empty() || sized;
+        if query_terms(query).is_empty() {
             return Err(EngineError::new("query_empty", "Query has no searchable words"));
         }
         let limit = request.limit.clamp(1, 200);
@@ -878,6 +978,7 @@ impl Engine {
             kinds: &request.kinds,
             modified_after: request.modified_after,
             modified_before: request.modified_before,
+            extra: &parsed.extra,
         };
         let hybrid = *self.hybrid.read();
         // The vector side only fuses when an embedder is live and the vector
@@ -889,7 +990,7 @@ impl Engine {
         // side dropped that lab query out of the top 10 (found in review).
         let vector_query = if hybrid.vec_weight > 0.0 && !self.vectors.is_empty() {
             self.embedder.as_ref().and_then(|embedder| {
-                let text = request.query.replace(['"', '“', '”'], " ");
+                let text = query.replace(['"', '“', '”'], " ");
                 embedder.embed_query(text.trim()).ok()
             })
         } else {
@@ -898,24 +999,42 @@ impl Engine {
         lap(&mut timing.embed);
         // Fusion and filename promotion must see a stable candidate union,
         // independent of the requested page. Pure BM25 keeps bounded retrieval.
-        let depth = if vector_query.is_some() {
+        let depth = if vector_query.is_some() || constrained {
             usize::MAX
         } else {
             request.offset.saturating_add(limit)
         };
-        let results = self.index.search_counted(&request.query, &filter, depth)?;
+        let mut results = self.index.search_counted(query, &filter, depth)?;
+        let (mut allowed, ruled_out) = if parsed.constraints.is_empty() {
+            (None, HashSet::new())
+        } else {
+            self.index.constraint_paths(&parsed.constraints)?
+        };
+        if sized {
+            let in_range = self.catalog.lock().paths_in_size(request.min_size, request.max_size)?;
+            allowed = Some(match allowed.take() {
+                Some(current) => current.intersection(&in_range).cloned().collect(),
+                None => in_range,
+            });
+        }
+        let permitted = |path: &str| !ruled_out.contains(path) && allowed.as_ref().is_none_or(|set| set.contains(path));
+        if constrained {
+            results.hits.retain(|hit| permitted(&hit.path));
+            results.matched_paths.retain(|path| permitted(path));
+            results.total_files = results.matched_paths.len();
+        }
         lap(&mut timing.bm25);
-        let matcher = Matcher::new(&query_terms(&request.query), &self.index.options());
+        let matcher = Matcher::new(&query_terms(query), &self.index.options());
         // A quoted phrase is exact-only: the BM25 side enforces it, so
         // vector-only candidates must not bypass it.
-        let phrase_required = !quoted_phrases(&request.query).is_empty();
+        let phrase_required = !quoted_phrases(query).is_empty();
         // Keyword confidence of the BM25 head (see HybridOptions::head_coverage).
         // Page text read for coverage is a bounded blob-prefix on huge pages
         // and is reused for the snippet pass: a multi-MB log page is never
         // fully decoded on the search path.
         let mut page_texts: HashMap<(String, usize), PageRead> = HashMap::new();
         let coverage = if vector_query.is_some() && hybrid.head_coverage > 0.0 {
-            self.head_coverage(&request.query, &results, &hybrid, &mut page_texts, &mut timing)
+            self.head_coverage(query, &results, &hybrid, &mut page_texts, &mut timing)
         } else {
             Vec::new()
         };
@@ -923,7 +1042,7 @@ impl Engine {
         let catalog = self.catalog_timed(&mut timing.catalog_wait);
         let ranked = self.fused_hits(
             &catalog,
-            &request.query,
+            query,
             &page_texts,
             &results,
             &coverage,
@@ -937,6 +1056,9 @@ impl Engine {
         // Distinct matching files: BM25 matches plus vector candidates that
         // matched no BM25 term.
         let mut ranked = ranked;
+        if constrained {
+            ranked.retain(|hit| permitted(&hit.path));
+        }
         let mut total = results.total_files
             + if vector_query.is_some() {
                 ranked.iter().filter(|h| !results.matched_paths.contains(&h.path)).count()
@@ -949,19 +1071,20 @@ impl Engine {
         // strongest signal a user gives. A quoted phrase stays content-only.
         let mut name_only: HashSet<String> = HashSet::new();
         if !phrase_required {
-            let words: Vec<String> = query_terms(&request.query)
+            let words: Vec<String> = query_terms(query)
                 .iter()
                 .map(|t| crate::turkish::ascii_fold(t).replace(['\'', '’'], ""))
                 .filter(|w| !w.is_empty())
                 .collect();
             let shown: HashSet<&str> = ranked.iter().map(|h| h.path.as_str()).collect();
-            let numeric = crate::index::NumericRequirements::new(&request.query);
+            let numeric = crate::index::NumericRequirements::new(query);
             let mut named: Vec<(String, i64)> = catalog
                 .files_named(&words)?
                 .into_iter()
                 .filter(|(path, kind, modified)| {
                     !results.matched_paths.contains(path)
                         && !shown.contains(path.as_str())
+                        && permitted(path)
                         && numeric.matches_filename(Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(""))
                         && (filter.kinds.is_empty() || filter.kinds.contains(kind))
                         && filter.modified_after.is_none_or(|after| *modified >= after)
@@ -1094,7 +1217,7 @@ impl Engine {
             // One known word: any page that matched it covers the query.
             return Vec::new();
         }
-        let everything = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let everything = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         let counts_started = Instant::now();
         let term_files: Vec<usize> = terms
             .iter()
@@ -1233,6 +1356,10 @@ impl Engine {
     }
 
     pub fn document(&self, path: &str, query: &str) -> Result<DocumentView> {
+        // Highlight what the search looked for, not its operators or
+        // excluded words.
+        let parsed = crate::query::parse(query);
+        let query: &str = &parsed.text;
         let catalog = self.catalog.lock();
         let record = catalog
             .file(path)?
@@ -1409,7 +1536,7 @@ impl Worker {
         // The scan lock makes the start-up job indivisible against a
         // synchronous `index_folder_blocking` started by a caller that did
         // not wait for `ready`.
-        let result = self.run_job(Job::All);
+        let result = self.run_job(Job::Live);
         let flagged = self.settle(&result, Some(&receiver));
         // A cancelled or failed start-up scan must not spawn an embedding
         // run: `handle` reports `Cancelled` and the pending files wait for
@@ -1491,7 +1618,7 @@ impl Worker {
                 if resume {
                     // The removal that cancelled this run asked for the
                     // other folders to carry on: scan them now.
-                    let result = self.run_job(Job::All);
+                    let result = self.run_job(Job::Live);
                     let flagged = self.settle(&result, Some(receiver));
                     if result.is_ok() && !flagged {
                         let result = self.run_backfill();
@@ -1547,8 +1674,12 @@ impl Worker {
             self.rebuild_index()?;
         }
         match job {
-            Job::All | Job::Resume => {
+            Job::All => {
                 let folders = self.catalog.lock().folder_ids()?;
+                self.scan_folders(&folders, None)
+            }
+            Job::Live | Job::Resume => {
+                let folders = self.catalog.lock().live_folder_ids()?;
                 self.scan_folders(&folders, None)
             }
             Job::Folder(id) => {
@@ -2560,7 +2691,7 @@ fn hash_candidate(path: &Path, size: i64, cancel: &AtomicBool) -> Result<Option<
     let limit = match FileKind::from_path(path) {
         Some(FileKind::Text | FileKind::Log) => Some(MAX_TEXT_FILE_BYTES),
         Some(FileKind::Image) => Some(MAX_IMAGE_FILE_BYTES),
-        Some(FileKind::Word | FileKind::Excel) => Some(MAX_OFFICE_FILE_BYTES),
+        Some(FileKind::Word | FileKind::Excel | FileKind::Presentation) => Some(MAX_OFFICE_FILE_BYTES),
         _ => None,
     };
     if limit.is_some_and(|limit| size >= 0 && size as u64 > limit) {
@@ -2676,7 +2807,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn request(query: &str, limit: usize, offset: usize) -> SearchRequest {
-        SearchRequest { query: query.into(), kinds: vec![], modified_after: None, modified_before: None, limit, offset }
+        SearchRequest { query: query.into(), kinds: vec![], modified_after: None, modified_before: None, min_size: None, max_size: None, limit, offset }
     }
 
     #[test]
@@ -2886,7 +3017,7 @@ pub(crate) mod tests {
         // This fixture has no embedder, so exercise coverage directly too.
         // Every page contains both terms: instrumentation must retain full
         // coverage while accounting for each count and each prefix read.
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         let results = engine.index.search_counted("kira sözleşmesi", &filter, 12).unwrap();
         let hybrid = HybridOptions::default();
         let mut pages = HashMap::new();
@@ -2913,7 +3044,7 @@ pub(crate) mod tests {
             total_files: 1,
             matched_paths: HashSet::from(["/bm25.pdf".to_string()]),
         };
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         let hybrid = HybridOptions::default();
         let query = [1.0f32, 0.0];
 
@@ -3165,6 +3296,73 @@ pub(crate) mod tests {
         assert_eq!(code(&pdf, 2), Some("preview_unavailable"), "page out of range");
         assert_eq!(code(&key(&root.join("not.docx")), 0), Some("preview_unavailable"));
         assert_eq!(code("nowhere.pdf", 0), Some("not_indexed"));
+    }
+
+    /// Operators narrow whole files: `-` and DEĞİL exclude a file that has
+    /// the word on any page, VE requires both, YAKIN/n wants the two words
+    /// close together, `*` completes a word. Plain queries are unchanged.
+    #[test]
+    fn search_operators_narrow_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("operatorler");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "kira sözleşmesi ve depozito bedeli").unwrap();
+        std::fs::write(root.join("b.txt"), "kira sözleşmesi imzalandı").unwrap();
+        std::fs::write(root.join("c.txt"), "kira bedeli on beş gün içinde ödenir").unwrap();
+        let engine = test_engine(&dir.path().join("data"));
+        engine.add_folder(&key(&root), None).unwrap();
+        flush(&engine);
+        let found = |query: &str| {
+            let mut names: Vec<String> = engine
+                .search(&request(query, 20, 0))
+                .unwrap()
+                .hits
+                .into_iter()
+                .map(|h| h.file_name)
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(found("kira"), ["a.txt", "b.txt", "c.txt"]);
+        assert_eq!(found("kira -depozito"), ["b.txt", "c.txt"]);
+        assert_eq!(found("kira DEĞİL depozito"), ["b.txt", "c.txt"]);
+        assert_eq!(found("kira VE depozito"), ["a.txt"]);
+        assert_eq!(found("+depozito kira"), ["a.txt"]);
+        assert_eq!(found("kira YAKIN/3 ödenir"), Vec::<String>::new());
+        assert_eq!(found("kira YAKIN/7 ödenir"), ["c.txt"]);
+        assert_eq!(found("imza*"), ["b.txt"]);
+        assert_eq!(engine.search(&request("kira -depozito", 20, 0)).unwrap().total, 2);
+    }
+
+    /// `word~` reaches misspelled words, `word&` makes synonyms count fully,
+    /// and the size bounds keep only files within them.
+    #[test]
+    fn fuzzy_synonym_and_size_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("bulanik");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "sözleşme imzalandı").unwrap();
+        std::fs::write(root.join("b.txt"), "sözleşme imzlndı ocr hatası, ocek ayı").unwrap();
+        std::fs::write(root.join("c.txt"), "icar akdi").unwrap();
+        std::fs::write(root.join("big.txt"), format!("muhasebe {}", "x ".repeat(5000))).unwrap();
+        let engine = test_engine(&dir.path().join("data"));
+        engine.add_folder(&key(&root), None).unwrap();
+        flush(&engine);
+        let found = |request: SearchRequest| {
+            let mut names: Vec<String> = engine.search(&request).unwrap().hits.into_iter().map(|h| h.file_name).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(found(request("imzalandı", 20, 0)), ["a.txt"]);
+        assert_eq!(found(request("imzalandı~2", 20, 0)), ["a.txt", "b.txt"]);
+        assert_eq!(found(request("ocak", 20, 0)), Vec::<String>::new());
+        assert_eq!(found(request("ocak~", 20, 0)), ["b.txt"]);
+        assert!(found(request("kira&", 20, 0)).contains(&"c.txt".to_string()));
+        assert_eq!(found(request("muhasebe", 20, 0)), ["big.txt"]);
+        let small = SearchRequest { max_size: Some(1000), ..request("muhasebe", 20, 0) };
+        assert_eq!(found(small), Vec::<String>::new());
+        let large = SearchRequest { min_size: Some(5000), ..request("muhasebe OR sözleşme", 20, 0) };
+        assert_eq!(found(large), ["big.txt"]);
     }
 
     /// File names are searchable: an empty file (or a photo with no text)
@@ -4015,7 +4213,7 @@ impl Engine {
     }
 
     pub fn debug_candidates(&self, query: &str, depth: usize) -> Result<DebugCandidates> {
-        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None, extra: &[] };
         let terms = query_terms(query);
         let options = self.index.options();
         let results = self.index.search_counted(query, &filter, depth)?;

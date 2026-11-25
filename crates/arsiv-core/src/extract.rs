@@ -3,6 +3,7 @@
 //! PDF: each page's text layer is used when it carries real text; otherwise the
 //! page is rendered at 300 DPI and OCR'd (handles scanned and mixed PDFs).
 //! Images: OCR. DOCX: document/headers/footers XML. XLSX: every sheet's cells.
+//! RTF, HTML, ODT/ODS/ODP, PPTX, XLS, UDF, EYP and EML: see `formats.rs`.
 
 use std::io::{BufRead, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,9 @@ use quick_xml::Reader;
 
 use crate::model::{ExtractedDocument, FileKind, PageText, TextSource};
 use crate::ocr::{is_cancelled, Cancelled, OcrConfig};
+
+#[path = "formats.rs"]
+mod formats;
 
 /// A page needs OCR when its text layer has fewer word characters than this.
 const MIN_TEXT_LAYER_CHARS: usize = 20;
@@ -213,16 +217,7 @@ impl Extractor {
         if std::fs::metadata(path).is_ok_and(|m| m.len() == 0) {
             return Ok(ExtractedDocument::new(kind, vec![PageText::new(0, String::new(), TextSource::Native, None)]));
         }
-        let pages = match kind {
-            FileKind::Pdf => self.pdf(path, &ocr, cancel)?,
-            FileKind::Image => {
-                let _slot = self.budget.acquire();
-                vec![self.ocr_image_file(path, &ocr, cancel)?]
-            }
-            FileKind::Word => docx_cancellable(path, cancel)?,
-            FileKind::Excel => xlsx_cancellable(path, cancel)?,
-            FileKind::Text | FileKind::Log => txt(path)?,
-        };
+        let pages = self.read_pages(kind, path, &ocr, cancel, false)?;
         if let Some(first) = pages.iter().find_map(|p| p.error.as_deref()) {
             if pages.iter().all(PageText::is_failed) {
                 bail!("No page could be read: {first}");
@@ -233,6 +228,39 @@ impl Extractor {
             document.ocr_language = Some(ocr.config.language.clone());
         }
         Ok(document)
+    }
+
+    /// The pages of one file by its kind and extension. `carried`: the file
+    /// came out of a container (EYP, e-mail), which is never opened again.
+    fn read_pages(&self, kind: FileKind, path: &Path, ocr: &OcrSetup, cancel: &AtomicBool, carried: bool) -> Result<Vec<PageText>> {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        Ok(match kind {
+            FileKind::Pdf => self.pdf(path, ocr, cancel)?,
+            FileKind::Image => {
+                let _slot = self.budget.acquire();
+                vec![self.ocr_image_file(path, ocr, cancel)?]
+            }
+            FileKind::Word => match ext.as_str() {
+                "odt" => formats::odf(path, cancel, false)?,
+                "rtf" => formats::rtf(path, cancel)?,
+                _ => docx_cancellable(path, cancel)?,
+            },
+            FileKind::Excel => match ext.as_str() {
+                "xls" | "ods" => formats::workbook(path, cancel)?,
+                _ => xlsx_cancellable(path, cancel)?,
+            },
+            FileKind::Presentation => match ext.as_str() {
+                "odp" => formats::odf(path, cancel, true)?,
+                _ => formats::pptx(path, cancel)?,
+            },
+            FileKind::Text if ext == "html" || ext == "htm" => formats::html(path, cancel)?,
+            FileKind::Text | FileKind::Log => txt(path)?,
+            FileKind::Email if carried => bail!("An e-mail inside a package is not opened"),
+            FileKind::Email => self.eml(path, ocr, cancel)?,
+            FileKind::Official if ext == "eyp" && carried => bail!("A package inside a package is not opened"),
+            FileKind::Official if ext == "eyp" => self.eyp(path, ocr, cancel)?,
+            FileKind::Official => formats::udf(path, cancel)?,
+        })
     }
 
     fn ocr_config<'a>(&self, ocr: &'a OcrSetup) -> Result<&'a OcrConfig> {
@@ -390,7 +418,13 @@ impl Extractor {
                 };
                 Ok(image.into_rgb8())
             }
-            FileKind::Word | FileKind::Excel | FileKind::Text | FileKind::Log => bail!("No page image for {} files", kind.as_str()),
+            FileKind::Word
+            | FileKind::Excel
+            | FileKind::Presentation
+            | FileKind::Text
+            | FileKind::Log
+            | FileKind::Email
+            | FileKind::Official => bail!("No page image for {} files", kind.as_str()),
         }
     }
 }

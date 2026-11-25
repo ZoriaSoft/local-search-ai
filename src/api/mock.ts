@@ -169,9 +169,12 @@ const DOCS: MockDoc[] = DEMO === "en" ? DOCS_EN : DOCS_TR;
 const kindOf = (path: string): FileKind => {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   if (ext === "pdf") return "pdf";
-  if (ext === "docx") return "word";
-  if (ext === "xlsx" || ext === "xlsm") return "excel";
-  if (ext === "txt") return "text";
+  if (["docx", "odt", "rtf"].includes(ext)) return "word";
+  if (["xlsx", "xlsm", "xls", "ods"].includes(ext)) return "excel";
+  if (ext === "pptx" || ext === "odp") return "presentation";
+  if (ext === "udf" || ext === "eyp") return "official";
+  if (ext === "eml") return "email";
+  if (["txt", "csv", "md", "json", "xml", "html", "htm"].includes(ext)) return "text";
   return "image";
 };
 
@@ -324,7 +327,7 @@ export function createMockBackend(): Backend {
 
   return {
     appInfo: async (): Promise<AppInfo> => ({
-      version: "0.3.1",
+      version: "0.4.0",
       ocrReady: !new URLSearchParams(location.search).has("noocr"),
       ocrDetail: new URLSearchParams(location.search).has("noocr")
         ? "Tesseract model not found: C:\\Program Files\\Zoria Arşiv\\tessdata\\tur.traineddata"
@@ -360,6 +363,13 @@ export function createMockBackend(): Backend {
       refreshCounts(id, null);
       changedHandlers.forEach((h) => h(visible().length));
       if (kinds.some((k) => !before.kinds.includes(k)) && progress.phase === "idle") void runAll([id]);
+      return folders.find((f) => f.id === id) as FolderInfo;
+    },
+    setFolderSchedule: async (id, schedule) => {
+      if (schedule && (schedule.days.length === 0 || schedule.start === schedule.end))
+        throw { code: "schedule_invalid", message: "Invalid schedule" };
+      if (!folders.some((f) => f.id === id)) throw { code: "folder_missing", message: String(id) };
+      folders = folders.map((f) => (f.id === id ? { ...f, schedule } : f));
       return folders.find((f) => f.id === id) as FolderInfo;
     },
     cancelIndexing: async () => {
@@ -422,6 +432,8 @@ export function createMockBackend(): Backend {
         .filter((d) => !request.kinds.length || request.kinds.includes(d.kind))
         .filter((d) => request.modifiedAfter === null || d.modified >= request.modifiedAfter)
         .filter((d) => request.modifiedBefore === null || d.modified <= request.modifiedBefore)
+        .filter((d) => request.minSize == null || d.size >= request.minSize)
+        .filter((d) => request.maxSize == null || d.size <= request.maxSize)
         .map((d) => {
           const perPage = d.pages.map((p) => matchRanges(p.text, terms).length);
           const best = perPage.indexOf(Math.max(...perPage));

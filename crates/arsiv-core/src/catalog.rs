@@ -9,6 +9,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::model::{FileKind, PageText, TextSource};
+use crate::schedule::FolderSchedule;
+use std::collections::HashSet;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +34,9 @@ pub struct FolderInfo {
     /// (embedded=0). The engine reports 0 when no model is in use.
     #[serde(default)]
     pub pending_embed_count: i64,
+    /// Timed updates instead of live watching; `None` = live.
+    #[serde(default)]
+    pub schedule: Option<FolderSchedule>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -143,11 +148,15 @@ const MIGRATIONS: &[&str] = &[
     "CREATE TABLE scan_errors(
        path TEXT NOT NULL, folder_id INTEGER NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
        error TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(folder_id,path));",
+    // 13: timed updates. `schedule` is a `FolderSchedule` as JSON (NULL =
+    // watched live); `schedule_last` the Unix time a timed run last started.
+    "ALTER TABLE folders ADD COLUMN schedule TEXT;
+     ALTER TABLE folders ADD COLUMN schedule_last INTEGER NOT NULL DEFAULT 0;",
 ];
 
 /// Bump when extraction learns to read files it used to fail on; every
 /// failure recorded by an older generation is retried on the next scan.
-pub const EXTRACT_VERSION: i64 = 1;
+pub const EXTRACT_VERSION: i64 = 2;
 
 /// Why a file could not be read, as a stable code the UI explains in
 /// Turkish (the raw error stays available as detail).
@@ -315,7 +324,8 @@ impl Catalog {
                (SELECT COUNT(*) FROM files WHERE folder_id=f.id AND low_confidence_pages>0),
                (SELECT COUNT(*) FROM files WHERE folder_id=f.id AND failed_pages>0),
                f.kinds,
-               (SELECT COUNT(*) FROM files WHERE folder_id=f.id AND embedded=0)
+               (SELECT COUNT(*) FROM files WHERE folder_id=f.id AND embedded=0),
+               f.schedule
              FROM folders f ORDER BY f.path COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], |r| {
@@ -331,9 +341,51 @@ impl Catalog {
                 missing: false,
                 kinds: decode_kinds(r.get::<_, Option<String>>(8)?.as_deref()),
                 pending_embed_count: r.get(9)?,
+                schedule: FolderSchedule::decode(r.get::<_, Option<String>>(10)?.as_deref()),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Sets (or with `None` clears) a folder's timed updates. Returns false
+    /// when the folder does not exist.
+    pub fn set_folder_schedule(&self, id: i64, schedule: Option<&FolderSchedule>) -> Result<bool> {
+        let stored = schedule.map(FolderSchedule::encode);
+        Ok(self.db.execute("UPDATE folders SET schedule=?2, schedule_last=0 WHERE id=?1", params![id, stored])? == 1)
+    }
+
+    /// Folders with timed updates: id, schedule, when a timed run last started.
+    pub fn folder_schedules(&self) -> Result<Vec<(i64, FolderSchedule, i64)>> {
+        let mut statement =
+            self.db.prepare("SELECT id, schedule, schedule_last FROM folders WHERE schedule IS NOT NULL ORDER BY id")?;
+        let rows = statement.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, i64>(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, schedule, last) = row?;
+            if let Some(schedule) = FolderSchedule::decode(schedule.as_deref()) {
+                out.push((id, schedule, last));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Indexed files whose size is within the bounds (bytes, inclusive).
+    pub fn paths_in_size(&self, min: Option<i64>, max: Option<i64>) -> Result<HashSet<String>> {
+        let mut statement = self.db.prepare("SELECT path FROM files WHERE size >= ?1 AND size <= ?2")?;
+        let rows = statement.query_map(params![min.unwrap_or(0), max.unwrap_or(i64::MAX)], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_schedule_last(&self, id: i64, at: i64) -> Result<()> {
+        self.db.execute("UPDATE folders SET schedule_last=?2 WHERE id=?1", params![id, at])?;
+        Ok(())
+    }
+
+    /// Folders updated live (watched, scanned at start-up): no schedule.
+    pub fn live_folder_ids(&self) -> Result<Vec<(i64, String)>> {
+        let ids = self.folder_ids()?;
+        let timed: HashSet<i64> = self.folder_schedules()?.into_iter().map(|(id, _, _)| id).collect();
+        Ok(ids.into_iter().filter(|(id, _)| !timed.contains(id)).collect())
     }
 
     pub fn folder_ids(&self) -> Result<Vec<(i64, String)>> {
@@ -1083,7 +1135,9 @@ mod tests {
                  DROP TRIGGER files_index_delete;
                  DROP TRIGGER files_index_update;
                  DROP TABLE index_state;
-                 DROP TABLE scan_errors;",
+                 DROP TABLE scan_errors;
+                 ALTER TABLE folders DROP COLUMN schedule;
+                 ALTER TABLE folders DROP COLUMN schedule_last;",
             )
             .unwrap();
         drop(catalog);
@@ -1353,7 +1407,7 @@ mod tests {
         assert!(catalog.set_folder_kinds(scans, &FileKind::ALL).unwrap());
         let stored: Option<String> =
             catalog.db.query_row("SELECT kinds FROM folders WHERE id=?1", [scans], |r| r.get(0)).unwrap();
-        assert_eq!(stored.as_deref(), Some("pdf,image,word,excel,text,log"), "logs opted in explicitly");
+        assert_eq!(stored.as_deref(), Some("pdf,image,word,excel,presentation,official,email,text,log"), "logs opted in explicitly");
         assert_eq!(catalog.folder_kinds(scans).unwrap().unwrap(), FileKind::ALL);
         assert!(catalog.set_folder_kinds(scans, &[FileKind::Image, FileKind::Pdf]).unwrap());
         assert!(!catalog.set_folder_kinds(99, &[FileKind::Pdf]).unwrap());

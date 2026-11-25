@@ -13,6 +13,7 @@ import { SearchIcon, WarnIcon } from "./Icons";
 import { Preview } from "./Preview";
 
 export type DateRange = keyof typeof t.filters.dateOptions;
+export type SizeRange = keyof typeof t.filters.sizeOptions;
 
 interface Props {
   backend: Backend;
@@ -22,6 +23,9 @@ interface Props {
   onKinds: (kinds: FileKind[]) => void;
   range: DateRange;
   onRange: (range: DateRange) => void;
+  size: SizeRange;
+  onSize: (size: SizeRange) => void;
+  onHelp: () => void;
   hits: SearchHit[];
   total: number;
   tookMs: number;
@@ -39,8 +43,8 @@ interface Props {
 
 
 export function SearchView(props: Props) {
-  const { backend, query, kinds, onKinds, range, onRange, hits, total, tookMs, loading, error, selected } = props;
-  const filtersActive = kinds.length > 0 || range !== "all";
+  const { backend, query, kinds, onKinds, range, onRange, size, onSize, hits, total, tookMs, loading, error, selected } = props;
+  const filtersActive = kinds.length > 0 || range !== "all" || size !== "all";
   const hasMore = total > hits.length;
 
   let body: React.ReactNode;
@@ -68,6 +72,9 @@ export function SearchView(props: Props) {
               <li key={tip}>{tip}</li>
             ))}
           </ul>
+          <button className="btn small help-open" onClick={props.onHelp}>
+            {t.help.open}
+          </button>
         </div>
       </div>
     );
@@ -192,6 +199,16 @@ export function SearchView(props: Props) {
             {(Object.keys(t.filters.dateOptions) as DateRange[]).map((key) => (
               <option key={key} value={key}>
                 {t.filters.dateOptions[key]}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="select">
+          <span>{t.filters.size}</span>
+          <select value={size} onChange={(e) => onSize(e.target.value as SizeRange)}>
+            {(Object.keys(t.filters.sizeOptions) as SizeRange[]).map((key) => (
+              <option key={key} value={key}>
+                {t.filters.sizeOptions[key]}
               </option>
             ))}
           </select>
