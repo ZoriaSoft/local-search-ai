@@ -23,7 +23,7 @@ interface FolderInfo {
   id: number; path: string;
   fileCount: number;      // supported files found at last scan
   indexedCount: number;   // successfully indexed
-  failedCount: number;    // extraction failed (see listFailures)
+  failedCount: number;    // extraction failures + directory traversal issues (see listFailures)
   lowConfidenceCount: number; // files with ≥1 low-confidence OCR page
   partialCount: number;   // indexed files with ≥1 unreadable page (see listFailures)
   lastScan: number | null;
@@ -118,7 +118,7 @@ interface UpdateInfo {
 interface FailureInfo {
   reason: "encrypted" | "access_denied" | "too_large" | "timeout" | "engine_missing" | "damaged" | "unsupported" | "ocr_failed" | "other";
   path: string; error: string; at: number;
-  failedPages: number | null;  // partially read file: unreadable page count; null = whole file failed
+  failedPages: number | null;  // partial file: unreadable page count; null = whole-file failure or directory traversal issue
   pageCount: number | null;
 }
 
@@ -180,7 +180,7 @@ interface Notices {
 | Event | Payload | When |
 |---|---|---|
 | `index://progress` | `IndexProgress` | at most ~5×/s while running, and on phase change |
-| `index://changed` | `{ documentCount: number }` | after each index commit (re-run the visible search) |
+| `index://changed` | `{ documentCount: number }` | after each index commit and after embedding backfill adds vectors (re-run search and invalidate the selected preview) |
 
 ## Behaviour guarantees
 
@@ -191,6 +191,16 @@ interface Notices {
   one-edit typos, proximity and office synonyms add lower-ranked matches.
 - Text in double quotes (`"kira sözleşmesi"`, also “…”) must occur as an exact
   phrase (diacritic-insensitive); unquoted words stay OR-combined.
+- Canonically equivalent NFC/NFD words match with offsets in the original
+  text. One-edit matches are also used by snippets and preview highlights.
+  Filename matching folds apostrophes symmetrically; multipart numeric
+  amounts/dates require adjacent numeric tokens, while single-number filename
+  prefixes remain supported.
+- BM25, configured semantic candidates and filename promotions form a stable
+  union before pagination. `total` and ordering do not depend on `limit` or
+  `offset`; the semantic candidate budget is fixed by `HybridOptions`, not
+  by the requested page. Large-page snippets read bounded overlapping windows
+  when the match is beyond the initial text prefix.
 - `lowConfidence` marks OCR pages whose mean Tesseract word confidence is below
   the floor `LOW_CONFIDENCE_FLOOR` (0.60); the text is still indexed.
 - A file that fails extraction is never silently dropped: it appears in
@@ -203,11 +213,26 @@ interface Notices {
 - The search index carries a schema version. An index from another version
   is discarded at start-up and rebuilt from the catalog's stored page text
   (no re-extraction, no OCR); progress is reported as a normal indexing run.
+- Catalog schema 12 records subsecond file freshness separately from public
+  epoch-second dates and filters. Legacy fractions are adopted only after
+  matching the stored content hash, preserving cached OCR and embeddings.
+  Index schema 3 rebuilds from cached pages for the Unicode tokenization change.
+- A catalog generation is dirtied transactionally with searchable file
+  mutations and acknowledged only after Tantivy commit and reader reload.
+  Interrupted nonempty indexes are reconciled at startup or before later
+  mutations; clean starts do not rebuild. Pre-upgrade catalogs reconcile once.
 - Folder watching covers directories: deleting or renaming a sub-folder drops
   (and, for a rename, re-adds under the new name) every record below it. A
   watched root that disappears is never cleaned up automatically: its records
   stay, `FolderInfo.missing` turns true and `index://changed` fires so the UI
   re-reads folders. `reindex` re-attaches the watcher once it is back.
+- Full scans and watcher batches exclude child symlinks/junctions, including
+  redirected ancestors; explicitly selected roots resolve to canonical paths.
+  Folder aliases are rejected, case-only renames keep one file identity, and
+  directory-to-file replacement removes the former descendants.
+- Incomplete traversal preserves records under failed scopes and reports
+  directory issues through `list_failures`; `retry_failures` retries those
+  directory paths too. A traversal issue does not replace a cached document.
 - Every command except `index_status` runs on a background thread; the UI
   thread never waits on SQLite, Tantivy or Tesseract.
 - File kinds are chosen per folder and kept in the catalog. Scans and the
@@ -221,9 +246,31 @@ interface Notices {
   some pages), files finished so far stay indexed and committed, and queued
   scans/watcher batches are dropped. `IndexProgress` goes `cancelling: true`
   → `phase: "idle", cancelled: true`. Records of files that vanished are kept
-  until a full rescan. `reindex` resumes: it is incremental (size+mtime), so
-  only the unfinished files are read. Text and semantic index are separate
+  until a full rescan. `reindex` resumes: it is incremental (size + precise
+  mtime), so only unfinished/changed files are read. Hashing is cancellable;
+  files already over a known input budget are not hashed first. Text and semantic index are separate
   stages: a cancel can leave files whose text is read (keyword search works)
   but whose embedding is pending — the idle snapshot reports them in
   `pendingEmbed` and files never read in `unread`. The next scan finishes
   both; `complete_embeddings` finishes the embeddings without a rescan.
+
+## File-reading budgets
+
+Limits are per document and independent of the search result window. Exceeding
+a limit produces a recorded file error rather than a partially accepted
+document; malformed workbook parser errors stay local to that file.
+
+| Input | Limit |
+|---|---|
+| Plain text / log | 16 MiB encoded input |
+| Image | 64 MiB encoded input; 20,000 px per edge; 50 million pixels; 128 MiB decoded output |
+| DOCX / XLSX / XLSM | 64 MiB encoded input; 4,096 ZIP entries |
+| Office XML / expanded members | 8 MiB per selected DOCX member or per XLSX member; 32 MiB aggregate |
+| Office extracted text | 16 MiB per document |
+| Workbook structure | 100,000 shared strings; 256 sheets; 250,000 cells in a sheet's dense rectangle and actual entries; 1 million actual cells per workbook |
+
+Image dimensions/output allocation are checked before orientation decoding,
+OCR and preview resizing. Workbook counts, cell references and actual ranges
+are inspected before dense cell materialization, including files whose
+declared dimensions/counts are incomplete. DOCX expansion checks actual bytes
+and cancellation while reading. XLSX text preserves interior empty columns.

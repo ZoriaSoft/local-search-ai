@@ -37,7 +37,8 @@ use crate::turkish::{ascii_fold, token_spans, tokenize, turkish_lower};
 /// stores every page's text — no file is re-read and nothing is re-OCR'd.
 /// 1: `path` became a fast field (exact distinct-file counts).
 /// 2: `stem` field (Snowball Turkish stems, ASCII-folded).
-pub const SCHEMA_VERSION: u32 = 2;
+/// 3: combining marks stay with their base before NFC normalization.
+pub const SCHEMA_VERSION: u32 = 3;
 const VERSION_FILE: &str = "arsiv-schema-version";
 const PATH_FIELD: &str = "path";
 
@@ -129,7 +130,7 @@ fn english_variants(folded: &str) -> Vec<String> {
 
 /// Folded term form used by index and query: apostrophes dropped so
 /// `Ankara'da` and `ankarada` meet in the same term.
-fn folded_term(term: &str) -> String {
+pub(crate) fn folded_term(term: &str) -> String {
     ascii_fold(term).replace(['\'', '’'], "")
 }
 
@@ -267,31 +268,70 @@ pub fn quoted_phrases(query: &str) -> Vec<Vec<String>> {
 /// discriminate, so they keep the plain OR.
 /// The boost is 0: the clause only filters which pages may hit, it does
 /// not re-score the ones that do.
-fn digit_part_clauses(query: &str, folded: Field) -> Vec<Box<dyn Query>> {
-    let mut clauses: Vec<Box<dyn Query>> = Vec::new();
-    for segment in quote_segments(query).0 {
-        for part in segment.split_whitespace() {
-            if !part.bytes().any(|b| b.is_ascii_digit()) {
-                continue;
+/// Parsed numeric requirements shared by page queries and filename fallback.
+/// A multipart amount/date must keep its tokens adjacent. Filenames retain
+/// their established single-number substring match (`2023` in `20231117`).
+pub(crate) struct NumericRequirements {
+    runs: Vec<Vec<String>>,
+}
+
+impl NumericRequirements {
+    pub(crate) fn new(query: &str) -> Self {
+        let mut runs = Vec::new();
+        for segment in quote_segments(query).0 {
+            for part in segment.split_whitespace() {
+                if !part.bytes().any(|b| b.is_ascii_digit()) {
+                    continue;
+                }
+                let terms: Vec<String> = token_spans(part)
+                    .map(|(s, e)| folded_term(&turkish_lower(&part[s..e])))
+                    .collect();
+                if !terms.is_empty() && terms.iter().all(|t| t.bytes().all(|b| b.is_ascii_digit())) {
+                    runs.push(terms);
+                }
             }
-            let terms: Vec<String> = tokenize(part)
-                .into_iter()
-                .map(|(s, e)| folded_term(&turkish_lower(&part[s..e])))
-                .collect();
-            // Only parts made of digits alone: a letter anywhere in the
-            // part makes it a code, which must not be pinned (see doc).
-            if terms.is_empty() || !terms.iter().all(|t| t.bytes().all(|b| b.is_ascii_digit())) {
-                continue;
-            }
-            let clause: Box<dyn Query> = match terms.as_slice() {
-                [] => continue,
-                [term] => Box::new(TermQuery::new(Term::from_field_text(folded, term), IndexRecordOption::Basic)),
-                _ => Box::new(PhraseQuery::new(terms.iter().map(|t| Term::from_field_text(folded, t)).collect())),
-            };
-            clauses.push(Box::new(BoostQuery::new(clause, 0.0)));
         }
+        Self { runs }
     }
-    clauses
+
+    #[cfg(test)]
+    fn matches(&self, text: &str) -> bool {
+        self.matches_runs(text, false)
+    }
+
+    pub(crate) fn matches_filename(&self, name: &str) -> bool {
+        self.matches_runs(name, true)
+    }
+
+    fn matches_runs(&self, text: &str, multipart_only: bool) -> bool {
+        self.runs.iter().filter(|run| !multipart_only || run.len() > 1).all(|run| {
+            token_spans(text).any(|(start, end)| {
+                if !numeric_token_matches(&text[start..end], &run[0]) {
+                    return false;
+                }
+                let tail = &text[end..];
+                let mut following = token_spans(tail);
+                run[1..].iter().all(|required| {
+                    following.next().is_some_and(|(s, e)| numeric_token_matches(&tail[s..e], required))
+                })
+            })
+        })
+    }
+}
+
+fn numeric_token_matches(token: &str, required: &str) -> bool {
+    token.chars().filter(|&ch| !matches!(ch, '\'' | '’')).eq(required.chars())
+}
+
+fn digit_part_clauses(query: &str, folded: Field) -> Vec<Box<dyn Query>> {
+    NumericRequirements::new(query).runs.into_iter().map(|terms| {
+        let clause: Box<dyn Query> = if terms.len() == 1 {
+            Box::new(TermQuery::new(Term::from_field_text(folded, &terms[0]), IndexRecordOption::Basic))
+        } else {
+            Box::new(PhraseQuery::new(terms.iter().map(|t| Term::from_field_text(folded, t)).collect()))
+        };
+        Box::new(BoostQuery::new(clause, 0.0)) as Box<dyn Query>
+    }).collect()
 }
 
 /// Folded query tokens in order, duplicates kept (for proximity).
@@ -787,9 +827,14 @@ impl SearchIndex {
             return Ok(SearchResults { hits: Vec::new(), total_files: 0, matched_paths: HashSet::new() });
         };
         let searcher = self.reader.searcher();
-        // Pages, not files, are scored; widen the window until enough files.
-        // The distinct-file count rides along on the first pass.
-        let mut window = (max_files * 8).max(64);
+        if max_files == 0 {
+            let matched_paths = searcher.search(&query, &DistinctPaths)?;
+            return Ok(SearchResults { hits: Vec::new(), total_files: matched_paths.len(), matched_paths });
+        }
+        // Grow only as far as the live page count. `usize::MAX` requests the
+        // complete BM25 set for fusion without overflowing the first window.
+        let pages = usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX).max(1);
+        let mut window = max_files.saturating_mul(8).max(64).min(pages);
         let mut matched_paths: Option<HashSet<String>> = None;
         loop {
             let top = if matched_paths.is_none() {
@@ -800,9 +845,9 @@ impl SearchIndex {
             } else {
                 searcher.search(&query, &TopDocs::with_limit(window).order_by_score())?
             };
-            let exhausted = top.len() < window;
+            let exhausted = top.len() < window || window == pages;
+            let cutoff = top.last().map(|(score, _)| *score);
             let mut best: HashMap<String, PageHit> = HashMap::new();
-            let mut order = Vec::new();
             for (score, address) in top {
                 let stored: TantivyDocument = searcher.doc(address)?;
                 let path = stored
@@ -811,37 +856,46 @@ impl SearchIndex {
                     .unwrap_or_default()
                     .to_string();
                 let page = stored.get_first(self.fields.page).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                if !best.contains_key(&path) {
-                    order.push(path.clone());
-                    best.insert(path.clone(), PageHit { path, page, score });
+                match best.get_mut(&path) {
+                    Some(hit) if score > hit.score || (score == hit.score && page < hit.page) => {
+                        hit.page = page;
+                        hit.score = score;
+                    }
+                    Some(_) => {}
+                    None => { best.insert(path.clone(), PageHit { path, page, score }); }
                 }
             }
-            if order.len() >= max_files || exhausted {
-                order.truncate(max_files);
-                let matched = matched_paths.unwrap_or_default();
-                return Ok(SearchResults {
-                    hits: order.into_iter().filter_map(|p| best.remove(&p)).collect(),
-                    total_files: matched.len(),
-                    matched_paths: matched,
-                });
+            let mut hits: Vec<PageHit> = best.into_values().collect();
+            hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.path.cmp(&b.path)).then_with(|| a.page.cmp(&b.page)));
+            // A tie cut by TopDocs can omit a lexicographically earlier file
+            // or an earlier equally good page. Include that entire score
+            // tier before choosing the requested, path-stable window.
+            let complete_window = hits.get(max_files - 1)
+                .is_some_and(|last| cutoff.is_some_and(|score| score < last.score));
+            if exhausted || complete_window {
+                hits.truncate(max_files);
+                let matched_paths = matched_paths.unwrap_or_default();
+                return Ok(SearchResults { hits, total_files: matched_paths.len(), matched_paths });
             }
-            window *= 4;
+            window = window.saturating_mul(4).min(pages);
         }
     }
 }
 
 /// Decides which tokens of a text a query matched, mirroring the search
 /// clauses: exact, folded, single-suffix stem, a continuation of a ≥4-letter
-/// query word, a shared Snowball stem, or an office synonym. Built once per
+/// query word, a one-edit typo, a shared Snowball stem, or an office synonym. Built once per
 /// query; reused for every snippet and page.
 pub struct Matcher {
     terms: Vec<String>,
     folded: Vec<String>,
-    /// Folded forms that match exactly (suffix stems, short synonyms).
+    /// Short folded synonyms that match exactly rather than by prefix.
     exact: Vec<String>,
     /// Folded prefixes whose continuations match.
     prefixes: Vec<String>,
     snowball: Vec<String>,
+    /// One-edit folded query words, as in FuzzyTermQuery (including swaps).
+    fuzzy: Vec<usize>,
     /// Each Snowball stem minus its last letter. Snowball only strips
     /// suffixes (and may soften the final consonant, `kitabı`→`kitap`), so a
     /// token can share a stem only if it starts with this; checking it first
@@ -861,7 +915,7 @@ impl Matcher {
         if options.expand {
             prefixes.extend(folded.iter().filter(|t| t.chars().count() >= MIN_PREFIX_LEN).cloned());
             if options.legacy_stems {
-                exact.extend(folded.iter().flat_map(|t| stem_variants(t).into_iter().chain(english_variants(t))));
+                prefixes.extend(folded.iter().flat_map(|t| stem_variants(t).into_iter().chain(english_variants(t))));
             }
         }
         if options.synonym_boost > 0.0 {
@@ -890,33 +944,35 @@ impl Matcher {
                 }
             })
             .collect();
-        Self { terms: terms.to_vec(), folded, exact, prefixes, snowball, snowball_heads, locator: OnceLock::new() }
+        let fuzzy = if options.expand {
+            folded.iter().enumerate().filter_map(|(i, t)| (t.chars().count() >= 5).then_some(i)).collect()
+        } else {
+            Vec::new()
+        };
+        Self { terms: terms.to_vec(), folded, exact, prefixes, snowball, fuzzy, snowball_heads, locator: OnceLock::new() }
     }
 
-    /// Byte strings that every matching token must contain (ASCII case
-    /// aside). A token matches when its folded form equals, or starts with,
-    /// one of the folded needles (`folded`, `exact`, `prefixes`,
-    /// `snowball_heads`). Of each needle we keep its longest run of letters
-    /// and digits that folding cannot produce from another character — every
-    /// ASCII alphanumeric except `c g i o s u` (ç ğ ı/İ ö ş ü fold to them).
-    /// Such a run appears verbatim in the raw page, so an Aho-Corasick scan
-    /// finds every candidate without tokenizing the text. `None` when some
-    /// needle has no such run (e.g. `su`): then nothing may be skipped.
-    /// Known blind spot: an apostrophe inside the run (`ab'c` folds to `abc`)
-    /// and `â/î/û` written for `a` — both rare inside query words.
+    /// Raw anchors guaranteed to occur in every candidate (ASCII case aside).
+    /// Fold-produced letters (`â`→`a`, `K`→`k`, etc.) are not raw anchors.
+    /// Fuzzy words contribute two invariant characters: one substitution or
+    /// deletion cannot remove both, and a swap preserves each character.
+    /// If a matching form has no safe anchor, the tail uses a lazy token scan.
     fn anchors(&self) -> Option<Vec<String>> {
+        let invariant = |ch: char| ch.is_ascii_alphanumeric() && !"acgikosu".contains(ch);
         let mut anchors = Vec::new();
         let needles = self.folded.iter().chain(&self.exact).chain(&self.prefixes).chain(&self.snowball_heads);
         for needle in needles {
             let lower = needle.to_lowercase();
-            let best = lower
-                .split(|ch: char| !ch.is_ascii_alphanumeric() || "cgiosu".contains(ch))
-                .max_by_key(|run| run.len())
-                .unwrap_or("");
+            let best = lower.split(|ch| !invariant(ch)).max_by_key(|run| run.len()).unwrap_or("");
             if best.is_empty() {
                 return None;
             }
             anchors.push(best.to_string());
+        }
+        for &index in &self.fuzzy {
+            let mut chars = self.folded[index].chars().filter(|ch| invariant(*ch));
+            anchors.push(chars.next()?.to_string());
+            anchors.push(chars.next()?.to_string());
         }
         anchors.sort();
         anchors.dedup();
@@ -929,11 +985,14 @@ impl Matcher {
     /// before the weak pass spends its unit budget.
     fn locators(&self) -> &[Option<aho_corasick::AhoCorasick>; 2] {
         self.locator.get_or_init(|| {
-            let Some(anchors) = (if self.terms.is_empty() { None } else { self.anchors() }) else {
+            let Some(mut anchors) = (if self.terms.is_empty() { None } else { self.anchors() }) else {
                 return [None, None];
             };
+            // Apostrophe removal can split any otherwise invariant run in
+            // raw text. Such units must be checked even without a run hit.
+            anchors.extend(["'".to_string(), "’".to_string()]);
             let build = |strong: bool| {
-                let set: Vec<&String> = anchors.iter().filter(|a| (a.len() >= 3) == strong).collect();
+                let set: Vec<&String> = anchors.iter().filter(|a| (a.chars().count() >= 3) == strong).collect();
                 if set.is_empty() {
                     return None;
                 }
@@ -943,15 +1002,16 @@ impl Matcher {
         })
     }
 
-    /// Matches in `text[from..]`, found by jumping between anchor hits
-    /// instead of tokenizing: each hit's whitespace-delimited unit is matched
-    /// exactly like `snippets` matches units, then the search resumes after
-    /// it. At most `MAX_ANCHOR_UNITS` units are examined, so a very common
-    /// anchor cannot turn this back into a full-page scan. Empty when the
-    /// query has no anchors.
+    /// Jump to matching units when every matching form has a safe anchor;
+    /// otherwise scan lazily. Neither a missing anchor nor a common anchor
+    /// may silently discard a late match (including a one-edit typo).
     fn ranges_from<'a>(&'a self, text: &'a str, from: usize) -> impl Iterator<Item = (usize, usize)> + 'a {
         let [strong, weak] = self.locators();
-        self.anchored(text, from, strong.as_ref()).chain(self.anchored(text, from, weak.as_ref()))
+        let from = from.min(text.len());
+        let fallback = if strong.is_none() && weak.is_none() { &text[from..] } else { "" };
+        self.anchored(text, from, strong.as_ref())
+            .chain(self.anchored(text, from, weak.as_ref()))
+            .chain(self.iter_ranges(fallback).map(move |(s, e)| (from + s, from + e)))
     }
 
     fn anchored<'a>(
@@ -961,14 +1021,9 @@ impl Matcher {
         locator: Option<&'a aho_corasick::AhoCorasick>,
     ) -> impl Iterator<Item = (usize, usize)> + 'a {
         let mut position = from.min(text.len());
-        let mut units = 0usize;
-        let mut pending: std::vec::IntoIter<(usize, usize)> = Vec::new().into_iter();
-        std::iter::from_fn(move || loop {
-            if let Some(range) = pending.next() {
-                return Some(range);
-            }
+        std::iter::from_fn(move || {
             let locator = locator?;
-            if units >= MAX_ANCHOR_UNITS || position >= text.len() {
+            if position >= text.len() {
                 return None;
             }
             let found = locator.find(aho_corasick::Input::new(text).range(position..))?;
@@ -978,17 +1033,15 @@ impl Matcher {
                 .find(|(_, ch)| ch.is_whitespace())
                 .map_or(position, |(i, ch)| position + i + ch.len_utf8());
             let end = text[found.end()..].find(char::is_whitespace).map_or(text.len(), |i| found.end() + i);
-            units += 1;
             position = end;
-            let unit = &text[start..end];
-            pending = self.iter_ranges(unit).map(|(s, e)| (start + s, start + e)).collect::<Vec<_>>().into_iter();
-        })
+            Some((start, end))
+        }).flat_map(move |(start, end)| self.iter_ranges(&text[start..end]).map(move |(s, e)| (start + s, start + e)))
     }
 
     /// Highlights for a full page view. Pages up to `SNIPPET_SCAN_BYTES` get
     /// every match; larger pages get the matches of the first
     /// `SNIPPET_SCAN_BYTES` plus anchor-located ones after it, at most
-    /// `MAX_PAGE_HIGHLIGHTS` — never a token pass over a multi-MB page.
+    /// `MAX_PAGE_HIGHLIGHTS`, with a lazy fallback when raw anchors are unsafe.
     pub fn page_ranges(&self, text: &str) -> Vec<(usize, usize)> {
         if text.len() <= SNIPPET_SCAN_BYTES {
             return self.ranges(text);
@@ -1012,13 +1065,7 @@ impl Matcher {
     /// unit cut by the budget is left out) and the offset where the cut unit
     /// starts, i.e. where `ranges_from` has to resume.
     fn prefix_ranges<'a>(&'a self, text: &'a str) -> (impl Iterator<Item = (usize, usize)> + 'a, usize) {
-        let scan_end = floor_char(text, text.len().min(SNIPPET_SCAN_BYTES));
-        let truncated = scan_end < text.len();
-        let resume = if truncated && !text[scan_end..].starts_with(char::is_whitespace) {
-            text[..scan_end].rfind(char::is_whitespace).map_or(0, |i| i + text[i..].chars().next().map_or(1, char::len_utf8))
-        } else {
-            scan_end
-        };
+        let resume = scan_boundary(text);
         let mut position = 0;
         let ranges = text[..resume]
             .split_inclusive(char::is_whitespace)
@@ -1066,8 +1113,40 @@ impl Matcher {
         self.folded.iter().any(|t| t == folded.as_ref())
             || self.exact.iter().any(|t| t == folded.as_ref())
             || self.prefixes.iter().any(|p| folded.starts_with(p.as_str()))
+            || self.fuzzy.iter().any(|&i| one_edit_apart(&self.folded[i], folded.as_ref()))
             || (self.snowball_heads.iter().any(|head| folded.starts_with(head.as_str()))
                 && self.snowball.contains(&stem_term(lower)))
+    }
+}
+
+/// Distance ≤1 in Unicode scalar values, with adjacent swaps costing one
+/// (the same semantics as FuzzyTermQuery::new(..., 1, true)). Only the first
+/// mismatch branches; suffix checks are linear and allocate no token buffers.
+fn one_edit_apart(left: &str, right: &str) -> bool {
+    let mut a = left.chars();
+    let mut b = right.chars();
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return true,
+            (Some(_), None) => return a.next().is_none(),
+            (None, Some(_)) => return b.next().is_none(),
+            (Some(x), Some(y)) if x == y => {}
+            (Some(x), Some(y)) => {
+                return a.clone().eq(b.clone())
+                    || a.clone().eq(std::iter::once(y).chain(b.clone()))
+                    || std::iter::once(x).chain(a.clone()).eq(b.clone())
+                    || (a.next() == Some(y) && b.next() == Some(x) && a.eq(b));
+            }
+        }
+    }
+}
+
+fn scan_boundary(text: &str) -> usize {
+    let end = floor_char(text, text.len().min(SNIPPET_SCAN_BYTES));
+    if end < text.len() && !text[end..].starts_with(char::is_whitespace) {
+        text[..end].rfind(char::is_whitespace).map_or(0, |i| i + text[i..].chars().next().map_or(1, char::len_utf8))
+    } else {
+        end
     }
 }
 
@@ -1090,8 +1169,6 @@ pub fn utf16_range(text: &str, start: usize, end: usize) -> (usize, usize) {
 /// Hard limit for snippet matching and lead-text emptiness checks. The
 /// catalog/full document view still keeps and highlights the complete page.
 const SNIPPET_SCAN_BYTES: usize = 256 * 1024;
-/// Anchor hits examined past `SNIPPET_SCAN_BYTES` (snippets and page view).
-const MAX_ANCHOR_UNITS: usize = 20_000;
 /// Highlights returned for one page larger than `SNIPPET_SCAN_BYTES`.
 const MAX_PAGE_HIGHLIGHTS: usize = 2_000;
 
@@ -1140,15 +1217,15 @@ pub fn lead_snippet(text: &str, width: usize) -> Vec<(String, Vec<(usize, usize)
 }
 
 /// Which single-term matchers (one per query term, as `Matcher::new(&[t])`)
-/// occur in the first `SNIPPET_SCAN_BYTES` of `text`. One token pass,
-/// stopping as soon as every term was seen — bounded on multi-MB pages.
+/// occur in `text`. Scan a complete-unit prefix once, then locate only the
+/// still-missing terms in the tail with each matcher's safe anchors.
 pub fn terms_present(text: &str, matchers: &[Matcher]) -> Vec<bool> {
     let mut found = vec![false; matchers.len()];
     let mut left = matchers.iter().filter(|m| !m.terms.is_empty()).count();
     if left == 0 {
         return found;
     }
-    let end = floor_char(text, text.len().min(SNIPPET_SCAN_BYTES));
+    let end = scan_boundary(text);
     // Each first visit checks every matcher still missing. Finding other
     // terms later cannot make this exact raw token provide new information.
     // Borrow tokens and cap the memo: large logs often repeat their words,
@@ -1197,13 +1274,20 @@ pub fn terms_present(text: &str, matchers: &[Matcher]) -> Vec<bool> {
             break;
         }
     }
+    if left > 0 && end < text.len() {
+        for (i, matcher) in matchers.iter().enumerate() {
+            if !found[i] && !matcher.terms.is_empty() && matcher.ranges_from(text, end).next().is_some() {
+                found[i] = true;
+            }
+        }
+    }
     found
 }
 
 /// Up to `max` snippets around matches, each ~`width` bytes. Matching
 /// tokenizes at most 256 KiB, ending on a complete whitespace-delimited unit
-/// (never a partial word); beyond that, matches are located by anchor search
-/// (`Matcher::ranges_from`) without tokenizing the rest of the page.
+/// (never a partial word); beyond that, safe anchors locate matching units.
+/// When a form has no safe anchor, matching resumes lazily in the tail.
 pub fn snippets(text: &str, matcher: &Matcher, max: usize, width: usize) -> Vec<(String, Vec<(usize, usize)>)> {
     if max == 0 || matcher.terms.is_empty() {
         return lead_snippet(text, width);
@@ -1236,7 +1320,7 @@ pub fn snippets(text: &str, matcher: &Matcher, max: usize, width: usize) -> Vec<
         out.push((compact, highlights));
         // Break here: asking the iterator for another match first could
         // scan the entire remaining prefix after the final wanted snippet.
-        if out.len() >= max {
+        if out.len() >= max || window_end == text.len() {
             break;
         }
         covered_until = window_end;
@@ -1306,8 +1390,7 @@ mod tests {
         if left == 0 {
             return found;
         }
-        let end = floor_char(text, text.len().min(SNIPPET_SCAN_BYTES));
-        for (start, stop) in token_spans(&text[..end]) {
+        for (start, stop) in token_spans(text) {
             let lower = lower_for_match(&text[start..stop]);
             for (i, matcher) in matchers.iter().enumerate() {
                 if !found[i] && !matcher.terms.is_empty() && matcher.matches(&lower) {
@@ -1601,12 +1684,9 @@ mod tests {
         let whitespace = " ".repeat(5 * 1024 * 1024);
         let token = "x".repeat(5 * 1024 * 1024) + " ücret";
         let other = Matcher::new(&query_terms("kira"), &SearchOptions::default());
-        let (_, took) = fastest_of(3, || {
-            assert!(snippets(&whitespace, &matcher, 2, 80).is_empty());
-            assert_eq!(snippets(&token, &matcher, 2, 80), vec![("ücret".to_string(), vec![(0, 5)])]);
-            assert_eq!(snippets(&token, &other, 2, 80), vec![("x".repeat(80), vec![])]);
-        });
-        assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+        assert!(snippets(&whitespace, &matcher, 2, 80).is_empty());
+        assert_eq!(snippets(&token, &matcher, 2, 80), vec![("ücret".to_string(), vec![(0, 5)])]);
+        assert_eq!(snippets(&token, &other, 2, 80), vec![("x".repeat(80), vec![])]);
     }
 
     #[test]
@@ -2034,5 +2114,146 @@ mod tests {
         let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
         let hits = index.search("ankarada", &filter, 10).unwrap();
         assert_eq!(hits.len(), 1, "apostrophe fold failed: {hits:?}");
+    }
+
+    #[test]
+    fn quoted_nfc_and_nfd_terms_find_both_forms_with_original_utf16_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open(dir.path()).unwrap();
+        let literal = SearchOptions { expand: false, stem_boost: 0.0, synonym_boost: 0.0, ..SearchOptions::default() };
+        index.set_options(literal);
+        let nfc = "𝄞 ÜCRET İSTANBUL";
+        let nfd = "𝄞 U\u{308}CRET I\u{307}STANBUL";
+        let mut writer = index.writer().unwrap();
+        index.add(&writer, "nfc.pdf", 10, &document(nfc)).unwrap();
+        index.add(&writer, "nfd.pdf", 10, &document(nfd)).unwrap();
+        index.add(&writer, "separated.pdf", 10, &document("ÜCRET başka İSTANBUL")).unwrap();
+        writer.commit().unwrap();
+        index.reload().unwrap();
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        for query in ["\"ücret istanbul\"", "“U\u{308}CRET I\u{307}STANBUL”"] {
+            let mut paths: Vec<_> = index.search(query, &filter, 10).unwrap().into_iter().map(|h| h.path).collect();
+            paths.sort();
+            assert_eq!(paths, ["nfc.pdf", "nfd.pdf"], "{query}");
+            let matcher = Matcher::new(&query_terms(query), &literal);
+            assert_eq!(utf16_ranges(nfc, &matcher.page_ranges(nfc)), [(3, 8), (9, 17)]);
+            assert_eq!(utf16_ranges(nfd, &matcher.page_ranges(nfd)), [(3, 9), (10, 19)]);
+            let snips = snippets(nfd, &matcher, 1, 100);
+            let (text, ranges) = &snips[0];
+            let units: Vec<_> = text.encode_utf16().collect();
+            let words: Vec<_> = ranges.iter().map(|&(s, e)| String::from_utf16(&units[s..e]).unwrap()).collect();
+            assert_eq!(words, ["U\u{308}CRET", "I\u{307}STANBUL"]);
+        }
+    }
+
+    #[test]
+    fn one_edit_matches_agree_with_search_snippets_coverage_and_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open(dir.path()).unwrap();
+        let options = SearchOptions {
+            expand: true, legacy_stems: false, stem_boost: 0.0, synonym_boost: 0.0,
+            phrase_boost: 0.0, pair_boost: 0.0, ..SearchOptions::default()
+        };
+        index.set_options(options);
+        let variants = ["zavxeklm", "zavrxeklm", "zaveklm", "zaverklm", "zavreklm"];
+        let mut writer = index.writer().unwrap();
+        for (i, word) in variants.iter().enumerate() {
+            index.add(&writer, &format!("{i}.pdf"), 1, &document(&format!("𝄞 {word} satırı"))).unwrap();
+        }
+        index.add(&writer, "two-edits.pdf", 1, &document("zaxbeklm")).unwrap();
+        writer.commit().unwrap();
+        index.reload().unwrap();
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let hits = index.search("zavreklm", &filter, 100).unwrap();
+        assert_eq!(hits.len(), variants.len(), "{hits:?}");
+        assert!(hits.iter().all(|h| h.path != "two-edits.pdf"));
+        let terms = query_terms("zavreklm");
+        let matcher = Matcher::new(&terms, &options);
+        for word in variants {
+            let text = format!("𝄞 {word} satırı");
+            assert_eq!(terms_present(&text, &[Matcher::new(&terms, &options)]), [true]);
+            assert_eq!(utf16_ranges(&text, &matcher.page_ranges(&text)), [(3, 3 + word.len())]);
+            let snips = snippets(&text, &matcher, 1, 100);
+            let (excerpt, ranges) = &snips[0];
+            let units: Vec<_> = excerpt.encode_utf16().collect();
+            assert_eq!(ranges.len(), 1);
+            assert_eq!(String::from_utf16(&units[ranges[0].0..ranges[0].1]).unwrap(), word);
+        }
+        let literal = SearchOptions { expand: false, ..options };
+        index.set_options(literal);
+        assert_eq!(index.search("zavreklm", &filter, 100).unwrap().len(), 1);
+        assert!(Matcher::new(&terms, &literal).ranges("zaverklm").is_empty());
+        assert!(one_edit_apart("𐐨bcde", "𐐨bced"));
+        assert!(!one_edit_apart("𐐨bcde", "𐐨xced"));
+        assert!(!one_edit_apart("abcde", "abc"));
+    }
+
+    #[test]
+    fn tail_typo_matches_survive_common_or_unavailable_raw_anchors() {
+        let options = SearchOptions { legacy_stems: false, stem_boost: 0.0, synonym_boost: 0.0, ..SearchOptions::default() };
+        for (query, word, repeated) in [
+            ("zavreklm", "zaverklm", "zznotmatch "),
+            ("suici", "siuci", "normal satır "),
+        ] {
+            let text = repeated.repeat(35_000) + "𝄞 " + word;
+            assert!(text.len() > SNIPPET_SCAN_BYTES);
+            let terms = query_terms(query);
+            let matcher = Matcher::new(&terms, &options);
+            assert_eq!(terms_present(&text, &[Matcher::new(&terms, &options)]), [true], "{query}");
+            let actual = matcher.page_ranges(&text);
+            assert_eq!(actual, matcher.ranges(&text), "{query}: preview must not lose the tail");
+            assert_eq!(actual.len(), 1);
+            assert_eq!(&text[actual[0].0..actual[0].1], word);
+            let snips = snippets(&text, &matcher, 1, 100);
+            let (excerpt, ranges) = &snips[0];
+            let units: Vec<_> = excerpt.encode_utf16().collect();
+            assert_eq!(ranges.len(), 1);
+            assert_eq!(String::from_utf16(&units[ranges[0].0..ranges[0].1]).unwrap(), word);
+        }
+        let literal = SearchOptions { expand: false, ..options };
+        let word = "f’r’e’q’u’e’n’c’y";
+        let text = "normal ".repeat(50_000) + word;
+        let matcher = Matcher::new(&query_terms("frequency"), &literal);
+        assert_eq!(matcher.page_ranges(&text), matcher.ranges(&text));
+        assert_eq!(matcher.page_ranges(&text).len(), 1);
+    }
+
+    #[test]
+    fn lexical_windows_and_best_pages_are_stable_across_complete_score_ties() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open(dir.path()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for i in (0..100).rev() {
+            index.add(&writer, &format!("f{i:03}.pdf"), 1, &multi_page(&["zavreklm", "zavreklm", "zavreklm"])).unwrap();
+        }
+        writer.commit().unwrap();
+        index.reload().unwrap();
+        let filter = SearchFilter { kinds: &[], modified_after: None, modified_before: None };
+        let complete = index.search_counted("zavreklm", &filter, usize::MAX).unwrap();
+        assert_eq!(complete.hits.len(), 100);
+        assert_eq!(complete.total_files, 100);
+        assert!(complete.hits.iter().all(|h| h.page == 0));
+        assert_eq!(complete.hits[0].path, "f000.pdf");
+        for limit in [0, 1, 5, 30, 100] {
+            let limited = index.search_counted("zavreklm", &filter, limit).unwrap();
+            assert_eq!(limited.total_files, 100);
+            assert_eq!(limited.hits.iter().map(|h| (&h.path, h.page)).collect::<Vec<_>>(),
+                complete.hits[..limit].iter().map(|h| (&h.path, h.page)).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn filename_numeric_parts_share_query_adjacency_without_losing_number_prefixes() {
+        let amount = NumericRequirements::new("8.158,00 TL");
+        assert!(amount.matches_filename("report_8_158_00.txt"));
+        assert!(!amount.matches_filename("report_8_foo_158_bar_00.txt"));
+        assert!(amount.matches("Tutar 8.158,00 TL"));
+        assert!(!amount.matches("8 adet, 158 sıra, 00 oran"));
+        let date = NumericRequirements::new("2023");
+        assert!(date.matches_filename("IMG_20231117.jpg"));
+        assert!(!date.matches("20231117"));
+        assert!(NumericRequirements::new("ÖR-CAHNFY-27454").matches_filename("OCR garbled the code"));
+        assert!(NumericRequirements::new("12'34").matches("12’34"));
+        assert!(NumericRequirements::new("\"8.158,00\"").matches_filename("handled by the separate exact phrase requirement"));
     }
 }

@@ -24,6 +24,22 @@ foreach ($entry in $roots) {
 
 Push-Location $root
 try {
+    # onnxruntime.dll needs the Visual C++ runtime (MSVCP140, MSVCP140_1,
+    # VCRUNTIME140, VCRUNTIME140_1). A clean Windows has none of them, and the
+    # target PCs are often offline, so ship them next to zoria-arsiv.exe
+    # (app-local deployment; Windows looks in the exe folder first).
+    $vcrt = Join-Path $root "resources\vcrt"
+    New-Item -ItemType Directory -Force -Path $vcrt | Out-Null
+    $vsRoots = @("${env:ProgramFiles(x86)}\Microsoft Visual Studio", "$env:ProgramFiles\Microsoft Visual Studio")
+    $crtDir = Get-ChildItem $vsRoots -Recurse -Directory -Filter "Microsoft.VC14*.CRT" -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '\\Redist\\MSVC\\[0-9.]+\\x64\\' } |
+        Sort-Object FullName -Descending | Select-Object -First 1
+    if (-not $crtDir) { throw "Visual C++ x64 redist folder (Microsoft.VC14x.CRT) not found." }
+    foreach ($dll in @("msvcp140.dll", "msvcp140_1.dll", "vcruntime140.dll", "vcruntime140_1.dll")) {
+        Copy-Item -Force (Join-Path $crtDir.FullName $dll) $vcrt
+    }
+    Write-Output "Bundled Visual C++ runtime from $($crtDir.FullName)"
+
     $env:CARGO_ENCODED_RUSTFLAGS = $flags -join [char]31
     & npm.cmd run tauri -- build
     if ($LASTEXITCODE -ne 0) { throw "Windows release build failed (exit $LASTEXITCODE)." }

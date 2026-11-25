@@ -55,6 +55,9 @@ pub struct FileRecord {
     pub kind: FileKind,
     pub size: i64,
     pub modified: i64,
+    /// Nanosecond fraction of the filesystem mtime; NULL on legacy rows.
+    /// `modified` remains epoch seconds for public dates and search filters.
+    pub modified_subsec: Option<u32>,
     pub page_count: i64,
     pub ocr_pages: i64,
     pub low_confidence_pages: i64,
@@ -114,6 +117,32 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE files ADD COLUMN ocr_lang TEXT;
      UPDATE files SET ocr_lang='tur' WHERE ocr_pages>0;
      CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+    // 10: preserve subsecond freshness without changing API/filter seconds.
+    // NULL fractions are adopted after byte-hash verification, or reread.
+    "ALTER TABLE files ADD COLUMN modified_subsec INTEGER;
+     ALTER TABLE failures ADD COLUMN modified_subsec INTEGER;",
+    // 11: SQLite is authoritative. Every searchable file mutation dirties
+    // its generation in the same transaction, including FK cascades on folder
+    // removal. Only a successful Tantivy commit can acknowledge it. Existing
+    // catalogs reconcile once because their old index may have missed a batch.
+    "CREATE TABLE index_state(
+       id INTEGER PRIMARY KEY CHECK(id=1), generation INTEGER NOT NULL,
+       indexed_generation INTEGER NOT NULL);
+     INSERT INTO index_state VALUES(1, 1, 0);
+     CREATE TRIGGER files_index_insert AFTER INSERT ON files BEGIN
+       UPDATE index_state SET generation=generation+1 WHERE id=1;
+     END;
+     CREATE TRIGGER files_index_delete AFTER DELETE ON files BEGIN
+       UPDATE index_state SET generation=generation+1 WHERE id=1;
+     END;
+     CREATE TRIGGER files_index_update AFTER UPDATE OF path,kind,modified ON files BEGIN
+       UPDATE index_state SET generation=generation+1 WHERE id=1;
+     END;",
+    // 12: a failed traversal is not a file extraction failure and must not
+    // replace already searchable content. Keep its error separately for UI.
+    "CREATE TABLE scan_errors(
+       path TEXT NOT NULL, folder_id INTEGER NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+       error TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(folder_id,path));",
 ];
 
 /// Bump when extraction learns to read files it used to fail on; every
@@ -128,7 +157,7 @@ pub fn failure_reason(error: &str) -> &'static str {
         "encrypted"
     } else if e.contains("os error 5") || e.contains("access is denied") || e.contains("permission denied") || e.contains("os error 32") {
         "access_denied"
-    } else if e.contains("too large") {
+    } else if e.contains("too large") || e.contains("budget") || e.contains("input limit") || e.contains("-member limit") {
         "too_large"
     } else if e.contains("timed out") {
         "timeout"
@@ -199,9 +228,10 @@ impl Catalog {
     /// Adds a folder that indexes only `kinds` (error `kinds_empty` if none).
     pub fn add_folder_with_kinds(&self, path: &str, kinds: &[FileKind]) -> Result<i64> {
         let stored = encode_kinds(kinds)?;
-        let normalized = normalize_folder(path);
+        let canonical = canonical_folder(path);
+        let normalized = normalize_folder(&canonical);
         for existing in self.folder_paths()? {
-            let existing = normalize_folder(&existing);
+            let existing = normalize_folder(&canonical_folder(&existing));
             if existing == normalized {
                 bail!("folder_duplicate");
             }
@@ -209,19 +239,19 @@ impl Catalog {
                 bail!("folder_nested");
             }
         }
-        self.db.execute("INSERT INTO folders(path, kinds) VALUES (?1, ?2)", params![path, stored])?;
+        self.db.execute("INSERT INTO folders(path, kinds) VALUES (?1, ?2)", params![canonical, stored])?;
         Ok(self.db.last_insert_rowid())
     }
 
     /// Id of an already-registered folder for `path` (same normalization
     /// `add_folder` dedups on), or `None`.
     pub fn folder_id(&self, path: &str) -> Result<Option<i64>> {
-        let normalized = normalize_folder(path);
+        let normalized = normalize_folder(&canonical_folder(path));
         let mut statement = self.db.prepare("SELECT id, path FROM folders")?;
         let rows = statement.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
             let (id, existing) = row?;
-            if normalize_folder(&existing) == normalized {
+            if normalize_folder(&canonical_folder(&existing)) == normalized {
                 return Ok(Some(id));
             }
         }
@@ -280,7 +310,8 @@ impl Catalog {
                                  + (SELECT COUNT(*) FROM failures WHERE folder_id=f.id)),
                f.last_scan,
                (SELECT COUNT(*) FROM files WHERE folder_id=f.id),
-               (SELECT COUNT(*) FROM failures WHERE folder_id=f.id),
+               (SELECT COUNT(*) FROM failures WHERE folder_id=f.id)
+                 + (SELECT COUNT(*) FROM scan_errors WHERE folder_id=f.id),
                (SELECT COUNT(*) FROM files WHERE folder_id=f.id AND low_confidence_pages>0),
                (SELECT COUNT(*) FROM files WHERE folder_id=f.id AND failed_pages>0),
                f.kinds,
@@ -361,24 +392,42 @@ impl Catalog {
     /// True when the file is already indexed or failed with this exact
     /// size+mtime. An indexed file with OCR pages is current only if they
     /// were read with `ocr_language`, the current document language.
-    pub fn is_current(&self, path: &str, size: i64, modified: i64, ocr_language: &str) -> Result<bool> {
+    pub fn is_current(&self, path: &str, size: i64, modified: i64, modified_subsec: u32, ocr_language: &str) -> Result<bool> {
         let indexed: Option<i64> = self
             .db
             .query_row(
-                "SELECT 1 FROM files WHERE path=?1 AND size=?2 AND modified=?3 AND (ocr_pages=0 OR ocr_lang IS ?4)",
-                params![path, size, modified, ocr_language],
+                "SELECT 1 FROM files WHERE path=?1 AND size=?2 AND modified=?3 AND modified_subsec=?4 AND (ocr_pages=0 OR ocr_lang IS ?5)",
+                params![path, size, modified, modified_subsec, ocr_language],
                 |r| r.get(0),
             )
             .optional()?;
         let failed: Option<i64> = self
             .db
             .query_row(
-                "SELECT 1 FROM failures WHERE path=?1 AND size=?2 AND modified=?3 AND version=?4",
-                params![path, size, modified, EXTRACT_VERSION],
+                "SELECT 1 FROM failures WHERE path=?1 AND size=?2 AND modified=?3 AND modified_subsec=?4 AND version=?5",
+                params![path, size, modified, modified_subsec, EXTRACT_VERSION],
                 |r| r.get(0),
             )
             .optional()?;
         Ok(indexed.is_some() || failed.is_some())
+    }
+
+    /// A legacy row may have whole-second mtime only. It can acquire the
+    /// missing fraction without OCR/embedding if the current bytes match.
+    pub fn legacy_content_hash(&self, path: &str, size: i64, modified: i64, ocr_language: &str) -> Result<Option<String>> {
+        Ok(self.db.query_row(
+            "SELECT content_hash FROM files WHERE path=?1 AND size=?2 AND modified=?3
+               AND modified_subsec IS NULL AND failed_pages=0 AND (ocr_pages=0 OR ocr_lang IS ?4)",
+            params![path, size, modified, ocr_language], |r| r.get::<_, Option<String>>(0),
+        ).optional()?.flatten())
+    }
+
+    pub fn adopt_subsecond_mtime(&self, path: &str, size: i64, modified: i64, fraction: u32, hash: &str, ocr_language: &str) -> Result<bool> {
+        Ok(self.db.execute(
+            "UPDATE files SET modified_subsec=?4 WHERE path=?1 AND size=?2 AND modified=?3
+               AND modified_subsec IS NULL AND failed_pages=0 AND content_hash=?5 AND (ocr_pages=0 OR ocr_lang IS ?6)",
+            params![path, size, modified, fraction, hash, ocr_language],
+        )? == 1)
     }
 
     /// Stores the file record, its pages and its chunk embeddings in one
@@ -419,8 +468,8 @@ impl Catalog {
         let embedded = embedded && (copy_chunks_from.is_none() || cloned);
         tx.execute(
             "INSERT INTO files(path, folder_id, kind, size, modified, page_count, ocr_pages,
-                               low_confidence_pages, failed_pages, indexed_at, content_hash, embedded, ocr_lang)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                               low_confidence_pages, failed_pages, indexed_at, content_hash, embedded, ocr_lang, modified_subsec)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 record.path,
                 record.folder_id,
@@ -435,6 +484,7 @@ impl Catalog {
                 record.content_hash,
                 embedded as i64,
                 record.ocr_language.as_deref().filter(|_| record.ocr_pages > 0),
+                record.modified_subsec,
             ],
         )?;
         {
@@ -536,12 +586,61 @@ impl Catalog {
         Ok(())
     }
 
-    pub fn record_failure(&self, folder_id: i64, path: &str, size: i64, modified: i64, error: &str, at: i64) -> Result<()> {
-        self.db.execute("DELETE FROM files WHERE path=?1", [path])?;
-        self.db.execute(
-            "INSERT OR REPLACE INTO failures(path, folder_id, size, modified, error, at, version) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![path, folder_id, size, modified, error, at, EXTRACT_VERSION],
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_failure(&self, folder_id: i64, path: &str, size: i64, modified: i64, modified_subsec: u32, error: &str, at: i64) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute("DELETE FROM files WHERE path=?1", [path])?;
+        tx.execute(
+            "INSERT OR REPLACE INTO failures(path, folder_id, size, modified, modified_subsec, error, at, version)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![path, folder_id, size, modified, modified_subsec, error, at, EXTRACT_VERSION],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replace errors only in the subtree that was just inspected. Other
+    /// inaccessible subtrees keep their diagnostics until inspected again.
+    pub fn replace_scan_errors(&self, folder_id: i64, scope: &str, errors: &[(String, String)], at: i64) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        let prefix = normalize_folder(scope);
+        let previous: Vec<String> = {
+            let mut statement = tx.prepare("SELECT path FROM scan_errors WHERE folder_id=?1")?;
+            let rows = statement.query_map([folder_id], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for path in previous {
+            if normalize_folder(&path).starts_with(&prefix) {
+                tx.execute("DELETE FROM scan_errors WHERE folder_id=?1 AND path=?2", params![folder_id, path])?;
+            }
+        }
+        for (path, error) in errors {
+            tx.execute("INSERT OR REPLACE INTO scan_errors(folder_id,path,error,at) VALUES(?1,?2,?3,?4)",
+                params![folder_id, path, error, at])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn index_generation(&self) -> Result<i64> {
+        Ok(self.db.query_row("SELECT generation FROM index_state WHERE id=1", [], |r| r.get(0))?)
+    }
+
+    pub fn index_dirty(&self) -> Result<bool> {
+        Ok(self.db.query_row("SELECT generation != indexed_generation FROM index_state WHERE id=1", [], |r| r.get(0))?)
+    }
+
+    /// Also dirties index-only operations (schema rebuilds and failed writes).
+    pub fn invalidate_index(&self) -> Result<()> {
+        self.db.execute("UPDATE index_state SET generation=generation+1 WHERE id=1", [])?;
+        Ok(())
+    }
+
+    /// Called after commit + reader reload while the index writer is still
+    /// serialized. A newer catalog mutation can never be acknowledged by an
+    /// older batch, even if a future caller omits that serialization.
+    pub fn mark_index_committed(&self, generation: i64) -> Result<()> {
+        self.db.execute("UPDATE index_state SET indexed_generation=?1 WHERE id=1 AND generation=?1", [generation])?;
         Ok(())
     }
 
@@ -554,14 +653,15 @@ impl Catalog {
         {
             let mut statement = self.db.prepare(
                 "SELECT path FROM failures WHERE ?1 IS NULL OR folder_id=?1
-                 UNION SELECT path FROM files WHERE failed_pages>0 AND (?1 IS NULL OR folder_id=?1)",
+                 UNION SELECT path FROM files WHERE failed_pages>0 AND (?1 IS NULL OR folder_id=?1)
+                 UNION SELECT path FROM scan_errors WHERE ?1 IS NULL OR folder_id=?1",
             )?;
             for path in statement.query_map([folder_id], |r| r.get::<_, String>(0))? {
                 paths.push(path?);
             }
         }
         self.db.execute("UPDATE failures SET version=-1 WHERE ?1 IS NULL OR folder_id=?1", [folder_id])?;
-        self.db.execute("UPDATE files SET modified=-1 WHERE failed_pages>0 AND (?1 IS NULL OR folder_id=?1)", [folder_id])?;
+        self.db.execute("UPDATE files SET modified_subsec=NULL WHERE failed_pages>0 AND (?1 IS NULL OR folder_id=?1)", [folder_id])?;
         Ok(paths)
     }
 
@@ -577,7 +677,8 @@ impl Catalog {
         for row in rows {
             let (path, kind, modified) = row?;
             let name = path.rsplit(['\\', '/']).next().unwrap_or(&path);
-            let folded = crate::turkish::ascii_fold(&crate::turkish::turkish_lower(name));
+            let mut folded = crate::turkish::ascii_fold(&crate::turkish::turkish_lower(name));
+            folded.retain(|ch| ch != '\'' && ch != '’');
             if words.iter().all(|w| folded.contains(w.as_str())) {
                 out.push((path, FileKind::parse(&kind).unwrap_or(FileKind::Pdf), modified));
             }
@@ -596,6 +697,8 @@ impl Catalog {
     pub fn failures(&self, folder_id: Option<i64>) -> Result<Vec<FailureInfo>> {
         let mut statement = self.db.prepare(
             "SELECT path, error, at, NULL, NULL FROM failures WHERE ?1 IS NULL OR folder_id=?1
+             UNION ALL
+             SELECT path, error, at, NULL, NULL FROM scan_errors WHERE ?1 IS NULL OR folder_id=?1
              UNION ALL
              SELECT f.path,
                     COALESCE((SELECT error FROM pages WHERE path=f.path AND error IS NOT NULL ORDER BY idx LIMIT 1), ''),
@@ -622,7 +725,7 @@ impl Catalog {
             .db
             .query_row(
                 "SELECT path, folder_id, kind, size, modified, page_count, ocr_pages, low_confidence_pages, failed_pages,
-                        content_hash, ocr_lang
+                        content_hash, ocr_lang, modified_subsec
                    FROM files WHERE path=?1",
                 [path],
                 |r| {
@@ -633,6 +736,7 @@ impl Catalog {
                         kind: FileKind::parse(&kind).unwrap_or(FileKind::Pdf),
                         size: r.get(3)?,
                         modified: r.get(4)?,
+                        modified_subsec: r.get(11)?,
                         page_count: r.get(5)?,
                         ocr_pages: r.get(6)?,
                         low_confidence_pages: r.get(7)?,
@@ -716,9 +820,6 @@ impl Catalog {
             .map(|n| n.max(0) as usize))
     }
 
-    /// Page text capped at `max_bytes`: big stored pages (multi-MB logs,
-    /// mappings) are only ever needed in full for the document view; a
-    /// snippet never sees past it, so the search reads a bounded prefix.
     /// Page text capped at `max_bytes`, returned with `truncated` when the
     /// stored text is longer. Read through the incremental blob API:
     /// `substr(text,1,N)` costs a *full* row read in SQLite (measured: 80 ms
@@ -730,7 +831,7 @@ impl Catalog {
 
 
     /// Incremental read of `[from, from+max)` bytes of one page's text.
-    fn page_text_slice(&self, path: &str, index: usize, from: usize, max: usize) -> Result<Option<(String, bool)>> {
+    pub(crate) fn page_text_slice(&self, path: &str, index: usize, from: usize, max: usize) -> Result<Option<(String, bool)>> {
         let Some(rowid) = self
             .db
             .query_row("SELECT rowid FROM pages WHERE path=?1 AND idx=?2", params![path, index as i64], |r| r.get::<_, i64>(0))
@@ -873,9 +974,36 @@ fn vector_blob(vector: &[f32]) -> Vec<u8> {
     vector.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+/// Resolve existing roots (including `hop/../root` and explicit symlink
+/// roots). Nonexistent roots retain their stored spelling for offline drives.
+fn canonical_folder(path: &str) -> String {
+    std::fs::canonicalize(path).map(|p| display_path(&p)).unwrap_or_else(|_| path.to_string())
+}
+
+/// Windows canonical paths use a verbatim prefix which must not become a
+/// second catalog identity or leak into paths shown to users.
+pub(crate) fn display_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{unc}");
+        }
+        if let Some(plain) = path.strip_prefix(r"\\?\") {
+            return plain.to_string();
+        }
+    }
+    path.into_owned()
+}
+
 /// Case-insensitive (Windows) path key with a trailing separator.
 pub fn normalize_folder(path: &str) -> String {
-    let mut value = path.replace('/', "\\").to_lowercase();
+    let mut value = path.replace('/', "\\");
+    // Preserve distinct POSIX files while retaining Windows identity in
+    // cross-platform catalog fixtures and on Windows itself.
+    if cfg!(windows) || path.as_bytes().get(1) == Some(&b':') || path.starts_with(r"\\") {
+        value = value.to_lowercase();
+    }
     if !value.ends_with('\\') {
         value.push('\\');
     }
@@ -920,6 +1048,7 @@ mod tests {
             kind,
             size: 1,
             modified: 1,
+            modified_subsec: Some(0),
             page_count: 1,
             ocr_pages: 0,
             low_confidence_pages: 0,
@@ -947,7 +1076,14 @@ mod tests {
             .execute_batch(
                 "ALTER TABLE failures DROP COLUMN version;
                  ALTER TABLE files DROP COLUMN ocr_lang;
-                 DROP TABLE settings;",
+                 DROP TABLE settings;
+                 ALTER TABLE files DROP COLUMN modified_subsec;
+                 ALTER TABLE failures DROP COLUMN modified_subsec;
+                 DROP TRIGGER files_index_insert;
+                 DROP TRIGGER files_index_delete;
+                 DROP TRIGGER files_index_update;
+                 DROP TABLE index_state;
+                 DROP TABLE scan_errors;",
             )
             .unwrap();
         drop(catalog);
@@ -980,6 +1116,7 @@ mod tests {
             kind: FileKind::Text,
             size: 1,
             modified: 1,
+            modified_subsec: Some(0),
             page_count: 1,
             ocr_pages: 0,
             low_confidence_pages: 0,
@@ -1028,6 +1165,7 @@ mod tests {
             kind: FileKind::Pdf,
             size: 10,
             modified: 20,
+            modified_subsec: Some(0),
             page_count: pages,
             ocr_pages: pages - failed,
             low_confidence_pages: 0,
@@ -1111,10 +1249,10 @@ mod tests {
         };
         catalog.store(&record_text, &typed, &[], None, true, 1).unwrap();
 
-        assert!(catalog.is_current(r"C:\Arşiv\a.png", 10, 20, "tur").unwrap());
-        assert!(!catalog.is_current(r"C:\Arşiv\a.png", 10, 20, "tur+eng").unwrap());
-        assert!(!catalog.is_current(r"C:\Arşiv\a.png", 10, 20, "eng").unwrap());
-        assert!(catalog.is_current(r"C:\Arşiv\not.txt", 10, 20, "eng").unwrap());
+        assert!(catalog.is_current(r"C:\Arşiv\a.png", 10, 20, 0, "tur").unwrap());
+        assert!(!catalog.is_current(r"C:\Arşiv\a.png", 10, 20, 0, "tur+eng").unwrap());
+        assert!(!catalog.is_current(r"C:\Arşiv\a.png", 10, 20, 0, "eng").unwrap());
+        assert!(catalog.is_current(r"C:\Arşiv\not.txt", 10, 20, 0, "eng").unwrap());
         assert_eq!(catalog.files_to_reread("tur").unwrap(), 0);
         assert_eq!(catalog.files_to_reread("eng").unwrap(), 1);
         assert!(catalog.reusable_source("abc", FileKind::Image, r"C:\Arşiv\b.png", "tur").unwrap().is_some());
@@ -1124,7 +1262,7 @@ mod tests {
         // language is the one the pages were read with.
         let reread = FileRecord { ocr_language: Some("eng".into()), ..record_scan };
         catalog.store(&reread, &scan, &[], None, true, 2).unwrap();
-        assert!(catalog.is_current(r"C:\Arşiv\a.png", 10, 20, "eng").unwrap());
+        assert!(catalog.is_current(r"C:\Arşiv\a.png", 10, 20, 0, "eng").unwrap());
         assert_eq!(catalog.file(r"C:\Arşiv\a.png").unwrap().unwrap().ocr_language.as_deref(), Some("eng"));
     }
 
@@ -1237,7 +1375,7 @@ mod tests {
         let page = [PageText::new(0, "metin".into(), TextSource::Native, None)];
         catalog.store(&record(r"C:\Arşiv\a.pdf", 1, 0), &page, &[], None, true, 1).unwrap();
         catalog.store(&FileRecord { kind: FileKind::Text, ..record(r"C:\Arşiv\not.txt", 1, 0) }, &page, &[], None, true, 1).unwrap();
-        catalog.record_failure(id, r"C:\Arşiv\bozuk.XLSX", 1, 1, "Cannot open workbook", 1).unwrap();
+        catalog.record_failure(id, r"C:\Arşiv\bozuk.XLSX", 1, 1, 0, "Cannot open workbook", 1).unwrap();
         let mut outside = catalog.paths_outside_kinds(id, &[FileKind::Pdf]).unwrap();
         outside.sort();
         assert_eq!(outside, [r"C:\Arşiv\bozuk.XLSX", r"C:\Arşiv\not.txt"], "failures too, extension case-insensitive");
@@ -1266,7 +1404,7 @@ mod tests {
         ];
         catalog.store(&record(r"C:\Arşiv\karma.pdf", 3, 2), &pages, &[], None, true, 50).unwrap();
         catalog.store(&record(r"C:\Arşiv\temiz.pdf", 1, 0), &pages[..1], &[], None, true, 51).unwrap();
-        catalog.record_failure(1, r"C:\Arşiv\bozuk.pdf", 1, 1, "Cannot open PDF", 40).unwrap();
+        catalog.record_failure(1, r"C:\Arşiv\bozuk.pdf", 1, 1, 0, "Cannot open PDF", 40).unwrap();
 
         let failures = catalog.failures(Some(1)).unwrap();
         let summary: Vec<_> = failures.iter().map(|f| (f.path.as_str(), f.failed_pages, f.page_count)).collect();
@@ -1287,6 +1425,8 @@ mod tests {
         assert_eq!(failure_reason("Cannot open PDF: PdfiumLibraryInternalError(PasswordError)"), "encrypted");
         assert_eq!(failure_reason("Cannot read x: Access is denied. (os error 5)"), "access_denied");
         assert_eq!(failure_reason("Text file too large: 20 MB (limit 16 MB)"), "too_large");
+        assert_eq!(failure_reason("Office extracted text exceeds the text budget"), "too_large");
+        assert_eq!(failure_reason("Image file exceeds the 64 MiB input limit"), "too_large");
         assert_eq!(failure_reason("No page could be read: Tesseract timed out after 120 s"), "timeout");
         assert_eq!(failure_reason("Tesseract exited with exit code: 1"), "ocr_failed");
         assert_eq!(failure_reason("something else"), "other");

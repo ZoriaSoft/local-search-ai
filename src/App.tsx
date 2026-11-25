@@ -14,6 +14,7 @@ import { TopBar } from "./components/TopBar";
 import { Welcome } from "./components/Welcome";
 import { defaultOcrLanguage, language, ocrChosen, t, type Language } from "./i18n";
 import { createRequestGate } from "./lib/requestGate";
+import { createIndexRevision } from "./lib/indexRevision";
 
 const PAGE = 30;
 const IDLE: IndexProgress = {
@@ -64,6 +65,8 @@ export function App({ initialView = "search", onLanguage }: AppProps) {
   const input = useRef<HTMLInputElement>(null);
   const list = useRef<HTMLUListElement>(null);
   const searchId = useRef(0);
+  const revisionClock = useRef(createIndexRevision());
+  const [indexRevision, setIndexRevision] = useState(revisionClock.current.snapshot);
   const metaGate = useRef(createRequestGate());
   const busy = progress.phase !== "idle";
   const switchLanguage = (next: Language) => onLanguage(next, view);
@@ -98,7 +101,7 @@ export function App({ initialView = "search", onLanguage }: AppProps) {
         const response = await backend.search({
           query: text, kinds, modifiedAfter: rangeStart(range), modifiedBefore: null, limit: PAGE, offset,
         });
-        if (id !== searchId.current) return;
+        if (id !== searchId.current || !indexRevision.isCurrent()) return;
         setError(null);
         setTotal(response.total);
         setTookMs(response.tookMs);
@@ -110,7 +113,7 @@ export function App({ initialView = "search", onLanguage }: AppProps) {
           setAnnounce(t.search.results(response.total));
         }
       } catch (e) {
-        if (id !== searchId.current) return;
+        if (id !== searchId.current || !indexRevision.isCurrent()) return;
         const apiError = toApiError(e);
         if (apiError.code === "query_empty") {
           setHits([]);
@@ -118,10 +121,10 @@ export function App({ initialView = "search", onLanguage }: AppProps) {
           setError(null);
         } else setError(apiError);
       } finally {
-        if (id === searchId.current) setLoading(false);
+        if (id === searchId.current && indexRevision.isCurrent()) setLoading(false);
       }
     },
-    [backend, kinds, range],
+    [backend, kinds, range, indexRevision],
   );
 
   useEffect(() => {
@@ -230,6 +233,13 @@ export function App({ initialView = "search", onLanguage }: AppProps) {
     void runSearch(submitted, 0);
   }, [submitted, runSearch]);
 
+  // Advance synchronously: old search/document/image promises can resolve
+  // before React commits the state update and runs effect cleanups.
+  const refreshSearch = useCallback(() => {
+    searchId.current += 1;
+    setIndexRevision(revisionClock.current.advance());
+  }, []);
+
   // Re-run the visible search when the index changes.
   useEffect(() => {
     let live = true;
@@ -237,13 +247,13 @@ export function App({ initialView = "search", onLanguage }: AppProps) {
       // A pending unsubscription must not start an older query again.
       if (!live) return;
       refreshMeta();
-      void runSearch(submitted, 0);
+      refreshSearch();
     });
     return () => {
       live = false;
       void off.then((f) => f(), () => {});
     };
-  }, [backend, refreshMeta, runSearch, submitted]);
+  }, [backend, refreshMeta, refreshSearch]);
 
   const move = (delta: number) => {
     if (!hits.length) return;
@@ -277,7 +287,7 @@ export function App({ initialView = "search", onLanguage }: AppProps) {
     } else if (event.key === "Enter" && event.target === input.current) {
       // Search now instead of after the typing pause; when the text changed,
       // the `submitted` effect runs it (calling it here too searched twice).
-      if (query === submitted) void runSearch(query, 0);
+      if (query === submitted) refreshSearch();
       else setSubmitted(query);
     } else if (event.key === "Escape" && event.target === input.current) {
       setQuery("");
@@ -340,6 +350,7 @@ export function App({ initialView = "search", onLanguage }: AppProps) {
       <SearchView
         backend={backend}
         query={submitted}
+        indexRevision={indexRevision}
         kinds={kinds}
         onKinds={setKinds}
         range={range}
@@ -352,7 +363,7 @@ export function App({ initialView = "search", onLanguage }: AppProps) {
         selected={selected}
         onSelect={setSelected}
         onOpen={open}
-        onRetry={() => runSearch(submitted, 0)}
+        onRetry={refreshSearch}
         onMore={() => runSearch(submitted, hits.length)}
         documentCount={info?.documentCount ?? 0}
         listRef={list}

@@ -181,7 +181,7 @@ impl VectorIndex {
                     continue;
                 }
                 let score: f32 = query.iter().zip(truncated).map(|(q, d)| q * d).sum::<f32>() / norm;
-                if best.map_or(true, |(_, s)| score > s) {
+                if best.map_or(true, |(page, s)| score > s || (score == s && file.page_of_chunk[idx] < page)) {
                     best = Some((file.page_of_chunk[idx], score));
                 }
             }
@@ -521,5 +521,34 @@ mod tests {
         index.set("/b.pdf", FileKind::Pdf, 100, &[(0, vec![1.0, 0.0])]);
         index.set("/b.pdf", FileKind::Pdf, 100, &[]);
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn full_fusion_keeps_the_complete_union_and_limits_only_its_stable_prefix() {
+        let bm25 = [hit("/c.pdf", 0, 3.0), hit("/b.pdf", 1, 2.0), hit("/a.pdf", 2, 1.0)];
+        let vectors = [hit("/a.pdf", 9, 0.9), hit("/d.pdf", 3, 0.8), hit("/e.pdf", 4, 0.7)];
+        let options = options();
+        let complete = fuse(&bm25, &[], &vectors, &options, usize::MAX);
+        assert_eq!(complete.len(), 5);
+        let paths: std::collections::HashSet<_> = complete.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths.len(), complete.len());
+        assert_eq!(complete.iter().find(|h| h.path == "/a.pdf").unwrap().page, 2);
+        assert!(complete.iter().filter(|h| h.semantic_only).all(|h| h.path == "/d.pdf" || h.path == "/e.pdf"));
+        for limit in [0, 1, 3, 5, 100] {
+            let limited = fuse(&bm25, &[], &vectors, &options, limit);
+            assert_eq!(limited.iter().map(|h| (&h.path, h.page, h.semantic_only)).collect::<Vec<_>>(),
+                complete[..limit.min(complete.len())].iter().map(|h| (&h.path, h.page, h.semantic_only)).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn equal_vector_chunks_choose_the_earliest_page_not_insertion_order() {
+        let index = VectorIndex::empty();
+        let chunks = [(7, vec![1.0, 0.0]), (2, vec![1.0, 0.0]), (4, vec![1.0, 0.0])];
+        index.set("/a.pdf", FileKind::Pdf, 1, &chunks);
+        assert_eq!(index.search(&[1.0, 0.0], &filter(), &options())[0].page, 2);
+        let reversed: Vec<_> = chunks.into_iter().rev().collect();
+        index.set("/a.pdf", FileKind::Pdf, 1, &reversed);
+        assert_eq!(index.search(&[1.0, 0.0], &filter(), &options())[0].page, 2);
     }
 }

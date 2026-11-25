@@ -6,6 +6,7 @@ import { FILE_KINDS } from "../api/types";
 import { t } from "../i18n";
 import { formatCount, formatDate } from "../lib/format";
 import { nameRanges } from "../lib/nameRanges";
+import type { IndexRevision } from "../lib/indexRevision";
 import { Highlighted } from "./Highlighted";
 import { KindTile } from "./KindTile";
 import { SearchIcon, WarnIcon } from "./Icons";
@@ -16,6 +17,7 @@ export type DateRange = keyof typeof t.filters.dateOptions;
 interface Props {
   backend: Backend;
   query: string;
+  indexRevision: IndexRevision;
   kinds: FileKind[];
   onKinds: (kinds: FileKind[]) => void;
   range: DateRange;
@@ -209,6 +211,7 @@ export function SearchView(props: Props) {
           backend={backend}
           path={selected && hits.some((h) => h.path === selected) ? selected : null}
           query={query}
+          indexRevision={props.indexRevision}
           onError={props.onError}
         />
       </div>

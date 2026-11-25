@@ -13,7 +13,7 @@ export function asciiFold(text: string): string {
   return text.replace(/[çğıöşüâîû]/g, (ch) => ASCII[ch] ?? ch);
 }
 
-const WORD = /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu;
+const WORD = /[\p{L}\p{N}][\p{L}\p{N}\p{M}]*(?:['’][\p{L}\p{N}][\p{L}\p{N}\p{M}]*)*/gu;
 
 /** Folded term form: ASCII-folded with apostrophes dropped. */
 export function foldedTerm(term: string): string {
@@ -62,10 +62,53 @@ export function queryTerms(query: string): string[] {
   return [...new Set(Array.from(query.matchAll(WORD), (m) => turkishLower(m[0])))];
 }
 
-/** Token spans matching any term: exact, folded, stem, or strict prefix. */
+function pointWidth(text: string, at: number): number {
+  return (text.codePointAt(at) ?? 0) > 0xffff ? 2 : 1;
+}
+
+function equalTail(left: string, a: number, right: string, b: number): boolean {
+  if (left.length - a !== right.length - b) return false;
+  while (a < left.length) {
+    if (left.charCodeAt(a++) !== right.charCodeAt(b++)) return false;
+  }
+  return true;
+}
+
+/** Unicode one-edit distance, with an adjacent transposition costing one. */
+export function oneEditApart(left: string, right: string): boolean {
+  let a = 0;
+  let b = 0;
+  while (a < left.length && b < right.length) {
+    const x = left.codePointAt(a);
+    const y = right.codePointAt(b);
+    const nextA = a + pointWidth(left, a);
+    const nextB = b + pointWidth(right, b);
+    if (x !== y) {
+      return equalTail(left, nextA, right, nextB) || equalTail(left, nextA, right, b) || equalTail(left, a, right, nextB) || (
+        nextA < left.length && nextB < right.length &&
+        left.codePointAt(nextA) === y && right.codePointAt(nextB) === x &&
+        equalTail(left, nextA + pointWidth(left, nextA), right, nextB + pointWidth(right, nextB))
+      );
+    }
+    a = nextA;
+    b = nextB;
+  }
+  return (a === left.length && (b === right.length || b + pointWidth(right, b) === right.length)) ||
+    (b === right.length && a + pointWidth(left, a) === left.length);
+}
+
+export function codePointLength(text: string): number {
+  let length = 0;
+  for (let at = 0; at < text.length; at += (text.codePointAt(at) ?? 0) > 0xffff ? 2 : 1) length += 1;
+  return length;
+}
+
+/** Token spans matching any term: exact, folded, stem, prefix, or one edit. */
 export function matchRanges(text: string, terms: string[]): [number, number][] {
   const foldedTerms = terms.map(foldedTerm);
   const stems = foldedTerms.flatMap(stemVariants);
+  const prefixes = [...foldedTerms, ...stems].filter((term) => codePointLength(term) >= MIN_PREFIX_LEN);
+  const fuzzy = foldedTerms.filter((term) => codePointLength(term) >= 5);
   return tokenSpans(text).filter(([s, e]) => {
     const lower = turkishLower(text.slice(s, e));
     if (terms.includes(lower)) return true;
@@ -73,7 +116,8 @@ export function matchRanges(text: string, terms: string[]): [number, number][] {
     return (
       foldedTerms.includes(folded) ||
       stems.includes(folded) ||
-      foldedTerms.some((t) => t.length >= MIN_PREFIX_LEN && folded.startsWith(t))
+      prefixes.some((term) => folded.startsWith(term)) ||
+      fuzzy.some((term) => oneEditApart(term, folded))
     );
   });
 }

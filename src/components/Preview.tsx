@@ -5,6 +5,7 @@ import { toApiError } from "../api/client";
 import type { ApiError, DocumentView, PageImage, Range } from "../api/types";
 import { t } from "../i18n";
 import { formatDate, formatSize } from "../lib/format";
+import type { IndexRevision } from "../lib/indexRevision";
 import { Highlighted } from "./Highlighted";
 import { ExternalIcon, FolderIcon, WarnIcon } from "./Icons";
 import { KindTile } from "./KindTile";
@@ -13,6 +14,7 @@ interface Props {
   backend: Backend;
   path: string | null;
   query: string;
+  indexRevision: IndexRevision;
   onError: (message: string) => void;
 }
 
@@ -36,7 +38,9 @@ function renderWidth(cssWidth: number): number {
   return Math.min(2400, Math.max(400, Math.ceil(pixels / 200) * 200));
 }
 
-function PageImageView({ backend, doc, initialPage }: { backend: Backend; doc: DocumentView; initialPage: number }) {
+function PageImageView({ backend, doc, initialPage, indexRevision }: {
+  backend: Backend; doc: DocumentView; initialPage: number; indexRevision: IndexRevision;
+}) {
   const [page, setPage] = useState(initialPage);
   const [image, setImage] = useState<PageImage | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
@@ -52,13 +56,13 @@ function PageImageView({ backend, doc, initialPage }: { backend: Backend; doc: D
     setImage(null);
     const width = renderWidth(box.current?.clientWidth ?? 800);
     backend.getPageImage(doc.path, page, width).then(
-      (value) => live && setImage(value),
-      (e: unknown) => live && setError(toApiError(e)),
+      (value) => live && indexRevision.isCurrent() && setImage(value),
+      (e: unknown) => live && indexRevision.isCurrent() && setError(toApiError(e)),
     );
     return () => {
       live = false;
     };
-  }, [backend, doc.path, page, attempt]);
+  }, [backend, doc.path, page, attempt, indexRevision]);
 
   return (
     <div className="page-image" ref={box}>
@@ -98,8 +102,9 @@ function PageImageView({ backend, doc, initialPage }: { backend: Backend; doc: D
   );
 }
 
-export function Preview({ backend, path, query, onError }: Props) {
-  const [doc, setDoc] = useState<DocumentView | null>(null);
+export function Preview({ backend, path, query, indexRevision, onError }: Props) {
+  const [loaded, setLoaded] = useState<{ doc: DocumentView; query: string; revision: IndexRevision } | null>(null);
+  const doc = loaded?.query === query && loaded.revision === indexRevision && indexRevision.isCurrent() ? loaded.doc : null;
   const [error, setError] = useState<ApiError | null>(null);
   const [attempt, setAttempt] = useState(0);
   // Default is the text view; the choice then sticks for the session.
@@ -122,20 +127,21 @@ export function Preview({ backend, path, query, onError }: Props) {
   }, [doc, mode]);
 
   useEffect(() => {
-    if (!path) {
-      setDoc(null);
+    if (!path || !indexRevision.isCurrent()) {
+      setLoaded(null);
       return;
     }
     let live = true;
     setError(null);
+    setLoaded(null);
     backend.getDocument(path, query).then(
-      (value) => live && setDoc(value),
-      (e: unknown) => live && setError(toApiError(e)),
+      (value) => live && indexRevision.isCurrent() && setLoaded({ doc: value, query, revision: indexRevision }),
+      (e: unknown) => live && indexRevision.isCurrent() && setError(toApiError(e)),
     );
     return () => {
       live = false;
     };
-  }, [backend, path, query, attempt]);
+  }, [backend, path, query, attempt, indexRevision]);
 
   if (!path) {
     return (
@@ -247,7 +253,7 @@ export function Preview({ backend, path, query, onError }: Props) {
           <span>{t.preview.failedPages(failedPages)}</span>
         </div>
       )}
-      {showPage && <PageImageView backend={backend} doc={doc} initialPage={firstMatch ?? 0} />}
+      {showPage && <PageImageView backend={backend} doc={doc} initialPage={firstMatch ?? 0} indexRevision={indexRevision} />}
       {!showPage && doc.pages.map((page) => (
         <article
           className="page"

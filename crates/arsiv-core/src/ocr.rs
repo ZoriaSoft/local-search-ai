@@ -187,15 +187,24 @@ impl OcrConfig {
         }
         // Rust reads the file (Unicode-safe on every OS); Tesseract gets the
         // bytes on stdin, never the path (see `command`).
-        let bytes = std::fs::read(image_path).with_context(|| format!("Cannot read image {}", image_path.display()))?;
+        let file = std::fs::File::open(image_path).with_context(|| format!("Cannot read image {}", image_path.display()))?;
+        if file.metadata()?.len() > crate::extract::MAX_IMAGE_FILE_BYTES {
+            bail!("Image file exceeds the input byte budget");
+        }
+        let bytes = crate::extract::read_bounded(file, crate::extract::MAX_IMAGE_FILE_BYTES as usize, cancel)
+            .with_context(|| format!("Cannot read image {}", image_path.display()))?;
+        // Even an explicit PSM still sends these pixels to Tesseract. Reject
+        // unsafe dimensions/output buffers before either decoder can allocate.
+        let reader = image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format()?;
+        let decoder = crate::extract::checked_image_decoder(reader)
+            .with_context(|| format!("Cannot decode image {}", image_path.display()))?;
         let psm = match psm {
-            Some(psm) => psm,
-            None => select_psm(
-                &image::load_from_memory(&bytes)
-                    .with_context(|| format!("Cannot decode image {}", image_path.display()))?
-                    .into_luma8(),
-            ),
+            Some(psm) => { drop(decoder); psm }
+            None => select_psm(&image::DynamicImage::from_decoder(decoder)?.into_luma8()),
         };
+        if cancelled() {
+            return Err(Cancelled.into());
+        }
         let mut child = self
             .command()
             .arg("stdin")
@@ -597,5 +606,30 @@ mod cancel_tests {
         let error = config.recognize_cancellable(&image, Some(6), Some(&cancel)).unwrap_err();
         assert!(is_cancelled(&error));
         assert!(!pid_file.exists());
+    }
+}
+
+
+#[cfg(test)]
+mod image_budget_tests {
+    use super::*;
+
+    #[test]
+    fn unsafe_pixels_are_rejected_before_tesseract_even_with_an_explicit_psm() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.bmp");
+        std::fs::write(&path, crate::extract::parser_test_support::bmp_header(10_000, 5000)).unwrap();
+        let config = OcrConfig {
+            binary: dir.path().join("must-not-start"), tessdata: dir.path().into(), language: "tur".into(),
+            timeout: Duration::from_secs(1), threads: 1,
+        };
+        for psm in [None, Some(6)] {
+            let error = config.recognize_cancellable(&path, psm, None).unwrap_err();
+            assert!(format!("{error:#}").contains("pixel or memory budget"), "{error:#}");
+        }
+        let encoded = dir.path().join("oversized.png");
+        std::fs::File::create(&encoded).unwrap().set_len(crate::extract::MAX_IMAGE_FILE_BYTES + 1).unwrap();
+        let error = config.recognize_with_psm(&encoded, Some(6)).unwrap_err();
+        assert!(format!("{error:#}").contains("input byte budget"), "{error:#}");
     }
 }

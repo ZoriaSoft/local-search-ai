@@ -3,7 +3,7 @@
 //! `İ`→`i` and `I`→`ı` are applied *before* Unicode lowercasing; generic
 //! lowercasing alone maps `I` to `i`, which corrupts Turkish words.
 
-use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 /// NFC + Turkish-aware lowercase.
 pub fn turkish_lower(text: &str) -> String {
@@ -61,7 +61,7 @@ pub fn token_spans(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
         }
         let mut end = start + ch.len_utf8();
         while let Some(&(index, next)) = chars.peek() {
-            if is_word(next) {
+            if is_word(next) || is_combining_mark(next) {
                 end = index + next.len_utf8();
                 chars.next();
             } else if next == '\'' || next == '’' {
@@ -88,6 +88,16 @@ fn is_word(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decomposed_marks_belong_to_the_original_word_span() {
+        let text = "𝄞 U\u{308}CRET I\u{307}STANBUL Ankara’da\u{302} \u{308}son";
+        let tokens: Vec<&str> = token_spans(text).map(|(s, e)| &text[s..e]).collect();
+        assert_eq!(tokens, ["U\u{308}CRET", "I\u{307}STANBUL", "Ankara’da\u{302}", "son"]);
+        assert_eq!(turkish_lower(tokens[0]), "ücret");
+        assert_eq!(turkish_lower(tokens[1]), "istanbul");
+        assert_eq!(turkish_lower(tokens[2]), "ankara’dâ");
+    }
 
     #[test]
     fn dotted_and_dotless_i_keep_turkish_meaning() {

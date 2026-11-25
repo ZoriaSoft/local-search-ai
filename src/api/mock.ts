@@ -324,7 +324,7 @@ export function createMockBackend(): Backend {
 
   return {
     appInfo: async (): Promise<AppInfo> => ({
-      version: "0.3.0",
+      version: "0.3.1",
       ocrReady: !new URLSearchParams(location.search).has("noocr"),
       ocrDetail: new URLSearchParams(location.search).has("noocr")
         ? "Tesseract model not found: C:\\Program Files\\Zoria Arşiv\\tessdata\\tur.traineddata"

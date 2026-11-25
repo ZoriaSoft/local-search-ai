@@ -16,9 +16,9 @@ use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, Debouncer, N
 use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::catalog::{is_within, normalize_folder, Catalog, FailureInfo, FileRecord, FolderInfo};
+use crate::catalog::{display_path, is_within, normalize_folder, Catalog, FailureInfo, FileRecord, FolderInfo};
 use crate::embed::{document_title, ChunkVector, EmbedConfig, Embedder};
-use crate::extract::Extractor;
+use crate::extract::{Extractor, MAX_IMAGE_FILE_BYTES, MAX_OFFICE_FILE_BYTES, MAX_TEXT_FILE_BYTES};
 use crate::index::{
     lead_snippet, page_stats, query_terms, quoted_phrases, terms_present, snippets, utf16_ranges, Matcher, SearchFilter, SearchIndex, SearchOptions,
     SearchResults,
@@ -255,7 +255,7 @@ pub struct PageImage {
     pub data_url: String,
 }
 
-type PageImageKey = (String, usize, u32, i64);
+type PageImageKey = (String, usize, u32, i64, Option<u32>);
 
 /// Typed failure codes matching docs/API.md `ErrorCode`.
 #[derive(Debug, thiserror::Error)]
@@ -384,32 +384,83 @@ fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
-fn file_times(path: &Path) -> Option<(i64, i64)> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    let modified = meta
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs() as i64)?;
-    Some((meta.len() as i64, modified))
+fn file_times(meta: &std::fs::Metadata) -> Result<(i64, i64, u32)> {
+    let modified = meta.modified()?.duration_since(UNIX_EPOCH)?;
+    Ok((meta.len() as i64, modified.as_secs() as i64, modified.subsec_nanos()))
 }
 
 fn path_key(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+    display_path(path)
+}
+
+fn is_link_or_reparse(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Junctions need not have the symlink tag, but all reparse points
+        // have this bit. Full scans and watcher updates share this policy.
+        if meta.file_attributes() & 0x400 != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_absent(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
+}
+
+/// The explicitly registered root may itself be a link. No child, nor any
+/// ancestor between a child and that root, may redirect traversal. Inspect
+/// ancestors even for vanished paths; a watcher can deliver a leaf below a
+/// junction without ever delivering an event for the junction itself.
+fn allowed_child_path(root: &Path, path: &Path) -> std::io::Result<bool> {
+    if path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+        return Ok(false);
+    }
+    let root_key = normalize_folder(&path_key(root));
+    let key = normalize_folder(&path_key(path));
+    if key == root_key {
+        return Ok(true);
+    }
+    if !is_within(&key, &root_key) {
+        return Ok(false);
+    }
+    let mut children = Vec::new();
+    let mut within_root = false;
+    for ancestor in path.ancestors() {
+        if normalize_folder(&path_key(ancestor)) == root_key {
+            within_root = true;
+            break;
+        }
+        children.push(ancestor);
+    }
+    if !within_root {
+        return Ok(false);
+    }
+    for child in children.into_iter().rev() {
+        match std::fs::symlink_metadata(child) {
+            Ok(meta) if is_link_or_reparse(&meta) => return Ok(false),
+            Ok(_) => {},
+            Err(error) if is_absent(&error) => {},
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
 }
 
 impl Engine {
     pub fn open(paths: EnginePaths, on_progress: ProgressSink, on_changed: ChangedSink) -> Result<Arc<Self>> {
         let index_dir = paths.data_dir.join("index");
         let catalog = Arc::new(Mutex::new(Catalog::open(&paths.data_dir.join("catalog.db"))?));
+        let missing_index = !index_dir.join("meta.json").is_file();
         let index = Arc::new(SearchIndex::open(&index_dir)?);
-        // Rebuild from the catalog when the index was discarded (schema bump)
-        // or lost while the catalog still knows files.
-        let rebuild = index.discarded_stale() || (index.page_count() == 0 && catalog.lock().document_count()? > 0);
+        // A nonempty index can still have missed the last SQLite batch.
+        // Clean startups do not rebuild (including archives of blank files).
+        let rebuild = missing_index || index.discarded_stale() || catalog.lock().index_dirty()?;
         // The user's document language, unless its models went missing.
         let mut ocr = paths.ocr;
         if let Some(language) = catalog.lock().setting(OCR_LANGUAGE_SETTING)? {
@@ -475,6 +526,7 @@ impl Engine {
             cancel: engine.cancel.clone(),
             on_progress,
             on_changed,
+            embedding_changed: AtomicBool::new(false),
         };
         let ready = engine.ready.clone();
         std::thread::Builder::new()
@@ -579,7 +631,8 @@ impl Engine {
                     _ => e,
                 })?
         };
-        self.watch_folder(path)?;
+        let registered = self.catalog.lock().folder_path(id)?.ok_or_else(|| anyhow!("folder vanished"))?;
+        self.watch_folder(&registered)?;
         self.jobs.send(Job::Folder(id)).map_err(|_| anyhow!("indexer stopped"))?;
         self.folders()?
             .into_iter()
@@ -645,15 +698,22 @@ impl Engine {
         let resume = !self.progress.lock().cancelling && self.cancel_indexing();
         let (count, watcher_result) = {
             let _scan = self.scan.lock();
+            if self.catalog.lock().index_dirty()? {
+                self.detached_worker().rebuild_index()?;
+            }
             let folder_path = self.catalog.lock().folder_path(id)?;
-            let paths = self.catalog.lock().remove_folder(id)?;
+            // Acquire the writer before changing SQLite. Its generation
+            // trigger still makes a crash after the deletion recoverable.
             let mut writer = self.index.writer().map_err(|e| EngineError::new("index_busy", format!("{e:#}")))?;
+            let paths = self.catalog.lock().remove_folder(id)?;
             for path in &paths {
                 self.index.delete_path(&writer, path);
                 self.vectors.remove(path);
             }
+            let generation = self.catalog.lock().index_generation()?;
             writer.commit()?;
             self.index.reload()?;
+            self.catalog.lock().mark_index_committed(generation)?;
             let count = self.document_count()?;
             (count, folder_path.map_or(Ok(()), |path| self.unwatch_folder(&path)))
         };
@@ -836,12 +896,12 @@ impl Engine {
             None
         };
         lap(&mut timing.embed);
-        // Hybrid needs a deeper BM25 candidate pool than the answer window:
-        // a relevant file the vector side promotes may sit below it.
+        // Fusion and filename promotion must see a stable candidate union,
+        // independent of the requested page. Pure BM25 keeps bounded retrieval.
         let depth = if vector_query.is_some() {
-            (request.offset + limit).max(hybrid.candidates)
+            usize::MAX
         } else {
-            request.offset + limit
+            request.offset.saturating_add(limit)
         };
         let results = self.index.search_counted(&request.query, &filter, depth)?;
         lap(&mut timing.bm25);
@@ -871,7 +931,7 @@ impl Engine {
             &filter,
             &hybrid,
             phrase_required,
-            request.offset + limit,
+            usize::MAX,
             &mut timing.vectors,
         );
         // Distinct matching files: BM25 matches plus vector candidates that
@@ -895,12 +955,14 @@ impl Engine {
                 .filter(|w| !w.is_empty())
                 .collect();
             let shown: HashSet<&str> = ranked.iter().map(|h| h.path.as_str()).collect();
+            let numeric = crate::index::NumericRequirements::new(&request.query);
             let mut named: Vec<(String, i64)> = catalog
                 .files_named(&words)?
                 .into_iter()
                 .filter(|(path, kind, modified)| {
                     !results.matched_paths.contains(path)
                         && !shown.contains(path.as_str())
+                        && numeric.matches_filename(Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(""))
                         && (filter.kinds.is_empty() || filter.kinds.contains(kind))
                         && filter.modified_after.is_none_or(|after| *modified >= after)
                         && filter.modified_before.is_none_or(|before| *modified <= before)
@@ -951,7 +1013,18 @@ impl Engine {
                     let excerpts = if hit.semantic_only || name_only.contains(&hit.path) {
                         lead_snippet(&read.text, SNIPPET_WIDTH)
                     } else {
-                        snippets(&read.text, &matcher, 2, SNIPPET_WIDTH)
+                        let complete = if read.truncated {
+                            read.text.rfind(char::is_whitespace).map_or("", |end| &read.text[..end])
+                        } else {
+                            &read.text
+                        };
+                        let excerpts = snippets(complete, &matcher, 2, SNIPPET_WIDTH);
+                        if read.truncated && excerpts.iter().all(|(_, ranges)| ranges.is_empty()) {
+                            Self::tail_snippets(&catalog, &hit.path, hit.page, read.text.len(), &matcher)?
+                                .unwrap_or(excerpts)
+                        } else {
+                            excerpts
+                        }
                     };
                     if print {
                         eprintln!("    scan {:?} {:.1} ms", hit.path, ms(hit_started.elapsed()));
@@ -1122,6 +1195,43 @@ impl Engine {
         fuse(&results.hits, coverage, &vectors, hybrid, needed)
     }
 
+    /// Read rare far-tail matches incrementally, without decoding or retaining
+    /// an entire multi-megabyte page for each search result.
+    fn tail_snippets(
+        catalog: &Catalog,
+        path: &str,
+        page: usize,
+        prefix_bytes: usize,
+        matcher: &Matcher,
+    ) -> Result<Option<Vec<(String, Vec<(usize, usize)>)>>> {
+        const OVERLAP: usize = 4096;
+        let mut from = prefix_bytes.saturating_sub(OVERLAP);
+        loop {
+            let Some((text, truncated)) = catalog.page_text_slice(path, page, from, SNIPPET_READ_BYTES)? else {
+                return Ok(None);
+            };
+            if text.is_empty() {
+                return Ok(None);
+            }
+            // A window may cut a token at either edge. Never report a
+            // partial token as an exact, inflected or fuzzy match.
+            let start = if from == 0 { 0 } else {
+                text.find(char::is_whitespace).map_or(text.len(), |at| at + text[at..].chars().next().map_or(0, char::len_utf8))
+            };
+            let end = if truncated { text.rfind(char::is_whitespace).unwrap_or(0) } else { text.len() };
+            if start < end {
+                let excerpts = snippets(&text[start..end], matcher, 2, SNIPPET_WIDTH);
+                if excerpts.iter().any(|(_, ranges)| !ranges.is_empty()) {
+                    return Ok(Some(excerpts));
+                }
+            }
+            if !truncated {
+                return Ok(None);
+            }
+            from = from.saturating_add(text.len().saturating_sub(OVERLAP).max(1));
+        }
+    }
+
     pub fn document(&self, path: &str, query: &str) -> Result<DocumentView> {
         let catalog = self.catalog.lock();
         let record = catalog
@@ -1171,7 +1281,7 @@ impl Engine {
             return Err(EngineError::new("preview_unavailable", format!("Page {} of {}", page + 1, record.page_count)));
         }
         let width = width.clamp(PAGE_IMAGE_MIN_WIDTH, PAGE_IMAGE_MAX_WIDTH);
-        let key = (path.to_string(), page, width, record.modified);
+        let key = (path.to_string(), page, width, record.modified, record.modified_subsec);
         if let Some(hit) = self.page_images.lock().get(&key) {
             return Ok(PageImage::clone(hit));
         }
@@ -1209,7 +1319,8 @@ impl Engine {
         // the app, which the blocking path used to bypass.
         let _scan = self.scan.lock();
         let id = self.ensure_folder(path)?;
-        worker.scan_folders(&[(id, path.to_string())], Some(on_progress))?;
+        let registered = self.catalog.lock().folder_path(id)?.ok_or_else(|| anyhow!("folder vanished"))?;
+        worker.scan_folders(&[(id, registered)], Some(on_progress))?;
         Ok(id)
     }
 
@@ -1234,12 +1345,15 @@ impl Engine {
         let worker = self.detached_worker();
         let _scan = self.scan.lock();
         let id = self.ensure_folder(path)?;
-        worker.scan_folders(&[(id, path.to_string())], Some(on_progress))?;
+        let registered = self.catalog.lock().folder_path(id)?.ok_or_else(|| anyhow!("folder vanished"))?;
+        worker.scan_folders(&[(id, registered)], Some(on_progress))?;
         let result = if self.cancel.load(Ordering::Relaxed) {
             Err(Cancelled.into())
         } else {
             worker.backfill_embeddings(Some(on_progress))
         };
+        drop(_scan);
+        worker.notify_embedding_changes();
         worker.settle(&result, None);
         if result.is_err() {
             on_progress(&self.progress());
@@ -1261,6 +1375,7 @@ impl Engine {
             cancel: self.cancel.clone(),
             on_progress: Arc::new(|_| {}),
             on_changed: Arc::new(|_| {}),
+            embedding_changed: AtomicBool::new(false),
         }
     }
 }
@@ -1276,6 +1391,7 @@ struct Worker {
     scan: Arc<Mutex<()>>,
     on_progress: ProgressSink,
     on_changed: ChangedSink,
+    embedding_changed: AtomicBool,
 }
 
 impl Worker {
@@ -1283,17 +1399,17 @@ impl Worker {
         if rebuild {
             // Not cancellable (a half-rebuilt index would not be rebuilt
             // again); a cancel request stops the start-up scan below instead.
-            let _scan = self.scan.lock();
-            let _ = self.rebuild_index();
+            let result = {
+                let _scan = self.scan.lock();
+                self.rebuild_index()
+            };
+            self.settle(&result, None);
         }
         // Index everything once at start-up (picks up changes made while closed).
         // The scan lock makes the start-up job indivisible against a
         // synchronous `index_folder_blocking` started by a caller that did
         // not wait for `ready`.
-        let result = {
-            let _scan = self.scan.lock();
-            self.handle(Job::All)
-        };
+        let result = self.run_job(Job::All);
         let flagged = self.settle(&result, Some(&receiver));
         // A cancelled or failed start-up scan must not spawn an embedding
         // run: `handle` reports `Cancelled` and the pending files wait for
@@ -1304,10 +1420,7 @@ impl Worker {
             // earlier) finish before `ready`: headless callers then see the full
             // index AND vectors. The UI does not gate on `ready`; the phase is
             // shown in the panel meanwhile.
-            let result = {
-                let _scan = self.scan.lock();
-                self.backfill_embeddings(None)
-            };
+            let result = self.run_backfill();
             self.settle(&result, Some(&receiver));
         }
         ready.set();
@@ -1315,20 +1428,14 @@ impl Worker {
             // An explicit backfill needs no second pass right after it (a
             // file whose embed failed would be retried at once).
             let embed_job = matches!(job, Job::Embed);
-            let result = {
-                let _scan = self.scan.lock();
-                self.handle(job)
-            };
+            let result = self.run_job(job);
             let flagged = self.settle(&result, Some(&receiver));
             // Successful scans may still leave unembedded files (embed was
             // skipped mid-run); finish them in the background. A cancelled
             // job leaves the rest for the next run — no background churn
             // right after "İptal".
             if result.is_ok() && !flagged && !embed_job {
-                let result = {
-                    let _scan = self.scan.lock();
-                    self.backfill_embeddings(None)
-                };
+                let result = self.run_backfill();
                 self.settle(&result, Some(&receiver));
             }
         }
@@ -1384,16 +1491,10 @@ impl Worker {
                 if resume {
                     // The removal that cancelled this run asked for the
                     // other folders to carry on: scan them now.
-                    let result = {
-                        let _scan = self.scan.lock();
-                        self.handle(Job::All)
-                    };
+                    let result = self.run_job(Job::All);
                     let flagged = self.settle(&result, Some(receiver));
                     if result.is_ok() && !flagged {
-                        let result = {
-                            let _scan = self.scan.lock();
-                            self.backfill_embeddings(None)
-                        };
+                        let result = self.run_backfill();
                         return self.settle(&result, Some(receiver));
                     }
                     return flagged;
@@ -1403,7 +1504,48 @@ impl Worker {
         flagged
     }
 
+    fn run_job(&self, job: Job) -> Result<()> {
+        let result = {
+            let _scan = self.scan.lock();
+            self.handle(job)
+        };
+        self.notify_embedding_changes();
+        result
+    }
+
+    fn run_backfill(&self) -> Result<()> {
+        let result = {
+            let _scan = self.scan.lock();
+            self.backfill_embeddings(None)
+        };
+        // Also notify files completed before a cancellation/error.
+        self.notify_embedding_changes();
+        result
+    }
+
+    fn notify_embedding_changes(&self) {
+        if self.embedding_changed.swap(false, Ordering::SeqCst) {
+            let count = self.catalog.lock().document_count();
+            if let Ok(count) = count {
+                (self.on_changed)(count);
+            }
+        }
+    }
+
+    fn commit_index(&self, writer: &mut tantivy::IndexWriter) -> Result<()> {
+        let generation = self.catalog.lock().index_generation()?;
+        writer.commit()?;
+        self.index.reload()?;
+        self.catalog.lock().mark_index_committed(generation)?;
+        Ok(())
+    }
+
     fn handle(&self, job: Job) -> Result<()> {
+        // A previous failed commit must be repaired before a later no-op
+        // scan can acknowledge its generation as if its pages were present.
+        if self.catalog.lock().index_dirty()? {
+            self.rebuild_index()?;
+        }
         match job {
             Job::All | Job::Resume => {
                 let folders = self.catalog.lock().folder_ids()?;
@@ -1438,6 +1580,9 @@ impl Worker {
     /// Drops the records (indexed and failed) of kinds the folder no longer
     /// selects, from the catalog and the index, and commits.
     fn purge(&self, folder_id: i64) -> Result<()> {
+        if self.catalog.lock().index_dirty()? {
+            self.rebuild_index()?;
+        }
         let dropped = {
             let catalog = self.catalog.lock();
             let Some(kinds) = catalog.folder_kinds(folder_id)? else { return Ok(()) };
@@ -1453,8 +1598,7 @@ impl Worker {
             self.catalog.lock().forget(path)?;
         }
         self.catalog.lock().adjust_file_count(folder_id, -(dropped.len() as i64))?;
-        writer.commit()?;
-        self.index.reload()?;
+        self.commit_index(&mut writer)?;
         let count = self.catalog.lock().document_count()?;
         (self.on_changed)(count);
         Ok(())
@@ -1488,9 +1632,10 @@ impl Worker {
         }
     }
 
-    /// Re-adds every catalogued file to an empty index from stored page text
-    /// (no extraction, no OCR). Used after a schema bump discarded the index.
+    /// Replaces the complete index from authoritative stored page text (no
+    /// extraction or OCR), after a schema change, loss, or interrupted batch.
     fn rebuild_index(&self) -> Result<()> {
+        self.catalog.lock().invalidate_index()?;
         let paths = self.catalog.lock().indexed_paths()?;
         self.emit(
             |p| {
@@ -1529,8 +1674,7 @@ impl Worker {
             }
         }
         self.emit(|p| p.phase = IndexPhase::Committing, None);
-        writer.commit()?;
-        self.index.reload()?;
+        self.commit_index(&mut writer)?;
         let count = self.catalog.lock().document_count()?;
         (self.on_changed)(count);
         self.emit(
@@ -1544,6 +1688,9 @@ impl Worker {
         Ok(())
     }
     fn scan_folders(&self, folders: &[(i64, String)], extra: Observer) -> Result<()> {
+        if self.catalog.lock().index_dirty()? {
+            self.rebuild_index()?;
+        }
         if folders.is_empty() {
             return Ok(());
         }
@@ -1554,13 +1701,18 @@ impl Worker {
         let mut work = Vec::new();
         let mut vanished = Vec::new();
         for (folder_id, folder) in folders {
-            // Records of kinds the folder no longer selects go first, even
-            // when the root is missing or the run is cancelled later.
             self.purge(*folder_id)?;
-            // A missing root (deleted, renamed, unplugged drive) keeps its
-            // records: the UI shows it as not found, nothing is dropped.
-            if !Path::new(folder).is_dir() {
-                continue;
+            // A missing root keeps its records. Permission/IO failures keep
+            // them too, but unlike absence are reported as traversal errors.
+            match std::fs::metadata(folder) {
+                Ok(meta) if meta.is_dir() => {},
+                Ok(_) => continue,
+                Err(error) if is_absent(&error) => continue,
+                Err(error) => {
+                    self.catalog.lock().replace_scan_errors(*folder_id, folder,
+                        &[(folder.clone(), error.to_string())], now())?;
+                    continue;
+                }
             }
             let kinds = self.folder_kinds(*folder_id)?;
             let present = self.collect_dir(*folder_id, Path::new(folder), &kinds, &mut work)?;
@@ -1575,9 +1727,38 @@ impl Worker {
         self.process(work, vanished, extra)
     }
 
-    /// Walks `dir`, queues files of the folder's `kinds` that changed since
-    /// they were catalogued, and returns every such path found. Stops with
-    /// `Cancelled` when a cancel is requested (large trees take a while).
+    /// Check exact mtime precision. A legacy second-only row with a known
+    /// matching byte hash adopts the fraction without replacing cached pages
+    /// or embeddings. A mismatch returns the hash for the work item so the
+    /// extraction path does not read the file twice just for hashing.
+    fn current_file(&self, path: &Path, size: i64, modified: i64, fraction: u32) -> Result<(bool, Option<String>)> {
+        let key = path_key(path);
+        let language = self.extractor.ocr_language();
+        let legacy = {
+            let catalog = self.catalog.lock();
+            if catalog.is_current(&key, size, modified, fraction, &language)? {
+                return Ok((true, None));
+            }
+            catalog.legacy_content_hash(&key, size, modified, &language)?
+        };
+        if let Some(legacy) = legacy {
+            {
+                match hash_candidate(path, size, &self.cancel) {
+                    Ok(Some(hash)) => {
+                        let current = hash == legacy && self.catalog.lock()
+                            .adopt_subsecond_mtime(&key, size, modified, fraction, &hash, &language)?;
+                        return Ok((current, Some(hash)));
+                    }
+                    Err(error) if is_cancelled(&error) => return Err(error),
+                    Ok(None) | Err(_) => {}, // extraction reports an unreadable file normally
+                }
+            }
+        }
+        Ok((false, None))
+    }
+
+    /// An incomplete traversal preserves known records beneath each failed
+    /// path. Successfully visited siblings can still be indexed/deleted.
     fn collect_dir(
         &self,
         folder_id: i64,
@@ -1586,29 +1767,68 @@ impl Worker {
         work: &mut Vec<WorkItem>,
     ) -> Result<HashSet<String>> {
         let mut present = HashSet::new();
-        for entry in walkdir::WalkDir::new(dir).follow_links(false).into_iter().filter_map(|e| e.ok()) {
+        let mut errors = Vec::new();
+        let mut walker = walkdir::WalkDir::new(dir).follow_links(false).into_iter();
+        while let Some(entry) = walker.next() {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err(Cancelled.into());
             }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    errors.push((path_key(error.path().unwrap_or(dir)), error.to_string()));
+                    continue;
+                }
+            };
             let path = entry.path();
+            let meta = match std::fs::symlink_metadata(path) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    errors.push((path_key(path), error.to_string()));
+                    walker.skip_current_dir();
+                    continue;
+                }
+            };
+            if entry.depth() > 0 && is_link_or_reparse(&meta) {
+                // Junctions can look like directories to WalkDir. Prune
+                // before descent, not after a leaf has escaped the root.
+                walker.skip_current_dir();
+                continue;
+            }
             if !entry.file_type().is_file() || !is_selected(path, kinds) || is_temporary(path) {
                 continue;
             }
-            let Some((size, modified)) = file_times(path) else { continue };
+            let (size, modified, fraction) = match file_times(&meta) {
+                Ok(stamp) => stamp,
+                Err(error) => {
+                    errors.push((path_key(path), error.to_string()));
+                    continue;
+                }
+            };
             let key = path_key(path);
-            present.insert(key.clone());
-            if !self.catalog.lock().is_current(&key, size, modified, &self.extractor.ocr_language())? {
-                work.push((folder_id, path.to_path_buf(), size, modified));
+            present.insert(key);
+            let (current, hash) = self.current_file(path, size, modified, fraction)?;
+            if !current {
+                work.push((folder_id, path.to_path_buf(), size, modified, fraction, hash));
             }
         }
+        let catalog = self.catalog.lock();
+        if !errors.is_empty() {
+            let uncertain: Vec<String> = errors.iter().map(|(path, _)| normalize_folder(path)).collect();
+            for known in catalog.paths_under(folder_id, &path_key(dir))? {
+                let key = normalize_folder(&known);
+                if uncertain.iter().any(|scope| key.starts_with(scope)) {
+                    present.insert(known);
+                }
+            }
+        }
+        catalog.replace_scan_errors(folder_id, &path_key(dir), &errors, now())?;
         Ok(present)
     }
 
-    /// Applies watcher events. Paths may be files or directories, existing or
-    /// gone: a vanished directory (deleted, or the old name of a rename)
-    /// drops every record under it; an appearing directory (new name of a
-    /// rename, moved in) is walked and indexed. Events touching a watched
-    /// root itself never delete records — a missing root is a UI state.
+    /// Watcher events obey the full-scan no-child-link policy, including
+    /// ancestor reparse points and vanished leaves. Only NotFound/ENOTDIR
+    /// confirms absence; all other IO failures preserve searchable records.
     fn update_paths(&self, paths: Vec<PathBuf>) -> Result<()> {
         let mut work = Vec::new();
         let mut vanished = Vec::new();
@@ -1625,11 +1845,31 @@ impl Worker {
                 continue;
             }
             let Some((folder_id, root)) = self.catalog.lock().folder_for(&key)? else { continue };
-            if !Path::new(&root).is_dir() {
-                roots_touched = true;
-                continue;
+            match std::fs::metadata(&root) {
+                Ok(meta) if meta.is_dir() => {},
+                Ok(_) => { roots_touched = true; continue; },
+                Err(error) if is_absent(&error) => { roots_touched = true; continue; },
+                Err(error) => {
+                    self.catalog.lock().replace_scan_errors(folder_id, &root,
+                        &[(root.clone(), error.to_string())], now())?;
+                    roots_touched = true;
+                    continue;
+                }
             }
-            match std::fs::metadata(&path) {
+            match allowed_child_path(Path::new(&root), &path) {
+                Ok(true) => {},
+                Ok(false) => {
+                    vanished.extend(self.catalog.lock().paths_under(folder_id, &key)?);
+                    continue;
+                }
+                Err(error) => {
+                    self.catalog.lock().replace_scan_errors(folder_id, &key,
+                        &[(key.clone(), error.to_string())], now())?;
+                    roots_touched = true;
+                    continue;
+                }
+            }
+            match std::fs::symlink_metadata(&path) {
                 Ok(meta) if meta.is_dir() => {
                     let kinds = self.folder_kinds(folder_id)?;
                     let present = self.collect_dir(folder_id, &path, &kinds, &mut work)?;
@@ -1640,36 +1880,80 @@ impl Worker {
                     }
                 }
                 Ok(meta) if meta.is_file() => {
-                    if !is_selected(&path, &self.folder_kinds(folder_id)?) || is_temporary(&path) {
-                        continue;
-                    }
-                    if let Some((size, modified)) = file_times(&path) {
-                        if !self.catalog.lock().is_current(&key, size, modified, &self.extractor.ocr_language())? {
-                            work.push((folder_id, path, size, modified));
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    // Gone: one file, or a whole directory of them.
+                    // This path may have been a directory, or the old
+                    // casing of the same NTFS file. Drop those identities
+                    // even if the replacement kind is not selected.
                     for known in self.catalog.lock().paths_under(folder_id, &key)? {
-                        if !Path::new(&known).exists() {
+                        if known != key {
                             vanished.push(known);
                         }
                     }
+                    if !is_selected(&path, &self.folder_kinds(folder_id)?) || is_temporary(&path) {
+                        continue;
+                    }
+                    match file_times(&meta) {
+                        Ok((size, modified, fraction)) => {
+                            let (current, hash) = self.current_file(&path, size, modified, fraction)?;
+                            if !current {
+                                work.push((folder_id, path, size, modified, fraction, hash));
+                            }
+                            self.catalog.lock().replace_scan_errors(folder_id, &key, &[], now())?;
+                        }
+                        Err(error) => {
+                            self.catalog.lock().replace_scan_errors(folder_id, &key,
+                                &[(key.clone(), error.to_string())], now())?;
+                            roots_touched = true;
+                        }
+                    }
+                }
+                Ok(_) => vanished.extend(self.catalog.lock().paths_under(folder_id, &key)?),
+                Err(error) if is_absent(&error) => {
+                    // The event can be the old casing of a renamed file on
+                    // Windows, so re-check each known identity before drop.
+                    let known_paths = self.catalog.lock().paths_under(folder_id, &key)?;
+                    for known in known_paths {
+                        match std::fs::symlink_metadata(&known) {
+                            Err(error) if is_absent(&error) => vanished.push(known),
+                            Err(error) => {
+                                self.catalog.lock().replace_scan_errors(folder_id, &known,
+                                    &[(known.clone(), error.to_string())], now())?;
+                                roots_touched = true;
+                            }
+                            Ok(_) => {},
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.catalog.lock().replace_scan_errors(folder_id, &key,
+                        &[(key.clone(), error.to_string())], now())?;
+                    roots_touched = true;
+                }
+            }
+        }
+        // On Windows, differently cased watcher spellings address one file.
+        // Canonicalize existing paths before dedup so that they cannot race
+        // two stores and resurrect both spellings in one batch.
+        #[cfg(windows)]
+        for item in &mut work {
+            if let Ok(actual) = std::fs::canonicalize(&item.1) {
+                let actual = PathBuf::from(path_key(&actual));
+                if actual != item.1 {
+                    vanished.extend(self.catalog.lock().paths_under(item.0, &path_key(&item.1))?
+                        .into_iter().filter(|known| known != &path_key(&actual)));
+                    item.1 = actual;
                 }
             }
         }
         let mut seen = HashSet::new();
-        work.retain(|item| seen.insert(item.1.clone()));
+        work.retain(|item| seen.insert(path_key(&item.1)));
+        // A path queued for store must never be deleted as an old spelling.
+        vanished.retain(|path| !seen.contains(path));
         vanished.sort();
         vanished.dedup();
-        // Keep the folders' file counts in step with what appeared or went,
-        // so the UI's "indexed/found" does not drift until the next scan.
         {
             let catalog = self.catalog.lock();
             let mut deltas: HashMap<i64, i64> = HashMap::new();
-            for (folder_id, path, _, _) in &work {
+            for (folder_id, path, _, _, _, _) in &work {
                 if !catalog.knows(&path_key(path))? {
                     *deltas.entry(*folder_id).or_default() += 1;
                 }
@@ -1685,7 +1969,6 @@ impl Worker {
         }
         if work.is_empty() && vanished.is_empty() {
             if roots_touched {
-                // Let the UI re-read folders (missing/back) without a rescan.
                 let count = self.catalog.lock().document_count()?;
                 (self.on_changed)(count);
             }
@@ -1709,6 +1992,7 @@ impl Worker {
         let mut writer = self.index.writer()?;
         let throttle = Mutex::new(Instant::now() - Duration::from_secs(1));
         let since_commit = Mutex::new(0usize);
+        let mutation_error = Mutex::new(None::<String>);
         let writer_lock = Mutex::new(&mut writer);
         // Files a cancel kept from finishing (not started, OCR killed, or
         // their embed was stopped — those keep their text, embedded=0).
@@ -1721,19 +2005,40 @@ impl Worker {
         // Tesseract processes at max(1, cores - 1).
         let pool = rayon::ThreadPoolBuilder::new().num_threads(self.extractor.ocr_jobs()).build()?;
         pool.install(|| {
-            work.par_iter().for_each(|(folder_id, path, size, modified)| {
+            work.into_par_iter().for_each(|(folder_id, path, size, modified, modified_subsec, known_hash)| {
                 if self.cancel.load(Ordering::Relaxed) {
                     skipped.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-                let key = path_key(path);
-                let content_hash = content_hash(path).ok();
-                let reuse = self.reusable(path, &key, content_hash.as_deref());
+                let key = path_key(&path);
+                let Some(root) = self.catalog.lock().folder_path(folder_id).ok().flatten() else { return };
+                match allowed_child_path(Path::new(&root), &path) {
+                    Ok(true) => {},
+                    Ok(false) => return,
+                    Err(error) => {
+                        let _ = self.catalog.lock().replace_scan_errors(folder_id, &key,
+                            &[(key.clone(), error.to_string())], now());
+                        return;
+                    }
+                }
+                // Text/log limits are knowable from metadata. Never stream
+                // gigabytes only to have extraction reject them afterwards.
+                let oversized_text = oversized_text(&path, size);
+                let hash = if known_hash.is_some() {
+                    Ok(known_hash)
+                } else { hash_candidate(&path, size, &self.cancel) };
+                if hash.as_ref().is_err_and(is_cancelled) {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                let content_hash = hash.ok().flatten();
+                let reuse = self.reusable(&path, &key, content_hash.as_deref());
                 // `copied` = a fully read identical file donated its pages;
                 // its chunk vectors are copied inside `store` too.
                 let (result, copied) = match reuse {
                     Some((document, source)) => (Ok(document), Some(source)),
-                    None => (self.extractor.extract_cancellable(path, &self.cancel), None),
+                    None if oversized_text => (Err(anyhow!("Text file too large (maximum {MAX_TEXT_FILE_BYTES} bytes)")), None),
+                    None => (self.extractor.extract_cancellable(&path, &self.cancel), None),
                 };
                 // A half-read file is neither indexed nor recorded as failed:
                 // it is simply not current, so the next scan picks it up.
@@ -1741,7 +2046,7 @@ impl Worker {
                     skipped.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-                let failed = result.is_err();
+                let mut failed = result.is_err();
                 // Stage 1 is over for this file before its (slow) embed
                 // starts: report it now, so "Metin okundu" is not held back
                 // by the embedding queue.
@@ -1804,10 +2109,11 @@ impl Worker {
                         let stats = page_stats(&document, LOW_CONFIDENCE_FLOOR);
                         let record = FileRecord {
                             path: key.clone(),
-                            folder_id: *folder_id,
+                            folder_id: folder_id,
                             kind: document.kind,
-                            size: *size,
-                            modified: *modified,
+                            size: size,
+                            modified: modified,
+                            modified_subsec: Some(modified_subsec),
                             page_count: stats.pages as i64,
                             ocr_pages: stats.ocr as i64,
                             low_confidence_pages: stats.low_confidence as i64,
@@ -1834,17 +2140,25 @@ impl Worker {
                         let stored = {
                             let writer = writer_lock.lock();
                             let cloned = self.catalog.lock().store(&record, &document.pages, &chunk_refs, copy_from, embedded, now());
-                            cloned.and_then(|cloned| self.index.add(&writer, &key, *modified, &document).map(|()| cloned))
+                            let stored = cloned.and_then(|cloned| self.index.add(&writer, &key, modified, &document).map(|()| cloned));
+                            if let Err(error) = &stored {
+                                self.index.delete_path(&writer, &key);
+                                if let Err(error) = self.catalog.lock().record_failure(
+                                    folder_id, &key, size, modified, modified_subsec, &format!("{error:#}"), now(),
+                                ) {
+                                    *mutation_error.lock() = Some(format!("{error:#}"));
+                                }
+                            }
+                            stored
                         };
                         match stored {
-                            Err(error) => {
-                                // Recorded as a failure, not a pending embed.
+                            Err(_) => {
+                                // Recorded as a failure under the writer
+                                // guard above, not a pending embed.
+                                failed = true;
                                 semantic = false;
                                 embed_finished = false;
                                 self.vectors.remove(&key);
-                                let _ = self.catalog.lock().record_failure(
-                                    *folder_id, &key, *size, *modified, &format!("{error:#}"), now(),
-                                );
                             }
                             Ok(cloned) => {
                                 // A refused copy means the donor changed or
@@ -1889,7 +2203,7 @@ impl Worker {
                                     // the vectors and flips the flag.
                                     let _ = self.catalog.lock().store_chunks(&key, &file_chunks);
                                 }
-                                self.vectors.set(&key, document.kind, *modified, &file_chunks);
+                                self.vectors.set(&key, document.kind, modified, &file_chunks);
                             }
                         }
                     }
@@ -1897,9 +2211,11 @@ impl Worker {
                         let writer = writer_lock.lock();
                         self.index.delete_path(&writer, &key);
                         self.vectors.remove(&key);
-                        let _ = self.catalog.lock().record_failure(
-                            *folder_id, &key, *size, *modified, &format!("{error:#}"), now(),
-                        );
+                        if let Err(error) = self.catalog.lock().record_failure(
+                            folder_id, &key, size, modified, modified_subsec, &format!("{error:#}"), now(),
+                        ) {
+                            *mutation_error.lock() = Some(format!("{error:#}"));
+                        }
                     }
                 }
                 let commit_now = {
@@ -1914,7 +2230,7 @@ impl Worker {
                 };
                 if commit_now {
                     let mut writer = writer_lock.lock();
-                    if writer.commit().is_ok() && self.index.reload().is_ok() {
+                    if mutation_error.lock().is_none() && self.commit_index(&mut writer).is_ok() {
                         let count = self.catalog.lock().document_count();
                         if let Ok(count) = count {
                             (self.on_changed)(count);
@@ -1951,6 +2267,12 @@ impl Worker {
             });
         });
         drop(writer_lock);
+        // Never acknowledge or commit a batch whose catalog counterpart
+        // failed. Dropping the writer rolls back its uncommitted mutations;
+        // committed SQLite rows remain dirty and reconcile on the next job.
+        if let Some(error) = mutation_error.into_inner() {
+            return Err(anyhow!(error));
+        }
         let interrupted = skipped.into_inner() > 0;
         // Vanished paths go last: a moved/copied file above could still
         // reuse their stored pages instead of being OCR'd again. A cancelled
@@ -1964,8 +2286,7 @@ impl Worker {
             }
         }
         self.emit(|p| p.phase = IndexPhase::Committing, extra);
-        writer.commit()?;
-        self.index.reload()?;
+        self.commit_index(&mut writer)?;
         let count = self.catalog.lock().document_count()?;
         (self.on_changed)(count);
         self.emit(
@@ -2140,6 +2461,7 @@ impl Worker {
                             vectors.iter().map(|c| (c.page, c.vector.clone())).collect();
                         self.catalog.lock().store_chunks(path, &chunk_refs)?;
                         self.vectors.set(path, record.kind, record.modified, &chunk_refs);
+                        self.embedding_changed.store(true, Ordering::SeqCst);
                         finished = true;
                     }
                     Err(error) if is_cancelled(&error) => return Err(error),
@@ -2227,14 +2549,54 @@ fn with_heartbeat<T>(interval: Duration, operation: impl FnOnce() -> T, heartbea
     })
 }
 
-fn content_hash(path: &Path) -> Result<String> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update_reader(std::fs::File::open(path)?)?;
-    Ok(hasher.finalize().to_hex().to_string())
+fn oversized_text(path: &Path, size: i64) -> bool {
+    matches!(FileKind::from_path(path), Some(FileKind::Text | FileKind::Log)) && size as u64 > MAX_TEXT_FILE_BYTES
 }
 
-/// (folder id, path, size, mtime) of a file to (re)index.
-type WorkItem = (i64, PathBuf, i64, i64);
+fn hash_candidate(path: &Path, size: i64, cancel: &AtomicBool) -> Result<Option<String>> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(Cancelled.into());
+    }
+    let limit = match FileKind::from_path(path) {
+        Some(FileKind::Text | FileKind::Log) => Some(MAX_TEXT_FILE_BYTES),
+        Some(FileKind::Image) => Some(MAX_IMAGE_FILE_BYTES),
+        Some(FileKind::Word | FileKind::Excel) => Some(MAX_OFFICE_FILE_BYTES),
+        _ => None,
+    };
+    if limit.is_some_and(|limit| size >= 0 && size as u64 > limit) {
+        return Ok(None);
+    }
+    content_hash(path, cancel).map(Some)
+}
+
+fn content_hash(path: &Path, cancel: &AtomicBool) -> Result<String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(Cancelled.into());
+    }
+    hash_reader(std::fs::File::open(path)?, cancel)
+}
+
+fn hash_reader(mut reader: impl std::io::Read, cancel: &AtomicBool) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Cancelled.into());
+        }
+        let count = match reader.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if count == 0 {
+            return Ok(hasher.finalize().to_hex().to_string());
+        }
+        hasher.update(&buffer[..count]);
+    }
+}
+
+/// (folder id, path, size, mtime seconds, mtime fraction) to (re)index.
+type WorkItem = (i64, PathBuf, i64, i64, u32, Option<String>);
 
 /// False for pure access events (open, read, close without writing): the
 /// indexer's own reads produce them (inotify reports `IN_OPEN`), and after a
@@ -2259,6 +2621,10 @@ fn is_temporary(path: &Path) -> bool {
         .and_then(|n| n.to_str())
         .map_or(false, |n| n.starts_with("~$") || n.ends_with(".tmp") || n.ends_with(".partial"))
 }
+
+#[cfg(test)]
+#[path = "engine_lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -2700,11 +3066,12 @@ pub(crate) mod tests {
             kind: FileKind::Image,
             size: 1,
             modified: 1,
+            modified_subsec: Some(0),
             page_count: 1,
             ocr_pages: 1,
             low_confidence_pages: 0,
             failed_pages: 0,
-            content_hash: Some(content_hash(&original).unwrap()),
+            content_hash: Some(content_hash(&original, &AtomicBool::new(false)).unwrap()),
             ocr_language: Some("tur".into()),
         };
         engine.catalog.lock().store(&record, &pages, &[], None, true, 1).unwrap();

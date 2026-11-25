@@ -1,19 +1,51 @@
-import { asciiFold, foldedTerm, queryTerms, turkishLower } from "./turkish.ts";
+import { codePointLength, foldedTerm, oneEditApart, queryTerms, tokenSpans, turkishLower } from "./turkish.ts";
 
-/** Where the query's words sit in a file name (case- and diacritic-free). */
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/** Folded text with each UTF-16 unit mapped back to its original grapheme. */
+function foldedName(name: string) {
+  let text = "";
+  const starts: number[] = [];
+  const ends: number[] = [];
+  for (const { segment, index } of graphemes.segment(name)) {
+    const folded = foldedTerm(turkishLower(segment));
+    text += folded;
+    for (let unit = 0; unit < folded.length; unit += 1) {
+      starts.push(index);
+      ends.push(index + segment.length);
+    }
+  }
+  return { text, starts, ends };
+}
+
+/** Filename substring matches, preserving original apostrophes/NFD offsets. */
 export function nameRanges(name: string, query: string): [number, number][] {
-  const folded = asciiFold(turkishLower(name));
-  // Folding keeps one char per char for Turkish names; anything else
-  // (combining marks, ligatures) would shift offsets, so no highlight.
-  if (folded.length !== name.length) return [];
+  const folded = foldedName(name);
   const ranges: [number, number][] = [];
   for (const term of queryTerms(query)) {
     const needle = foldedTerm(term);
     if (!needle) continue;
-    for (let at = folded.indexOf(needle); at >= 0; at = folded.indexOf(needle, at + needle.length)) {
-      ranges.push([at, at + needle.length]);
+    for (let at = folded.text.indexOf(needle); at >= 0; at = folded.text.indexOf(needle, at + needle.length)) {
+      const start = folded.starts[at];
+      const end = folded.ends[at + needle.length - 1];
+      if (start !== undefined && end !== undefined) ranges.push([start, end]);
+    }
+    // Content may have matched a one-edit typo even though the filename has
+    // the correctly spelled word. Highlight that word using the same edit
+    // semantics; literal substrings above keep their narrower highlight.
+    if (codePointLength(needle) >= 5) {
+      for (const [start, end] of tokenSpans(name)) {
+        const token = foldedTerm(turkishLower(name.slice(start, end)));
+        if (!token.includes(needle) && oneEditApart(needle, token)) ranges.push([start, end]);
+      }
     }
   }
-  ranges.sort((a, b) => a[0] - b[0]);
-  return ranges.filter((r, i) => i === 0 || r[0] >= (ranges[i - 1]?.[1] ?? 0));
+  ranges.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged: [number, number][] = [];
+  for (const range of ranges) {
+    const previous = merged.at(-1);
+    if (previous && range[0] < previous[1]) previous[1] = Math.max(previous[1], range[1]);
+    else merged.push(range);
+  }
+  return merged;
 }

@@ -190,7 +190,7 @@ export const tr = {
     reasons: {
       encrypted: { title: "Parola korumalı", help: "Dosya parolayla korunduğu için açılamadı. Parolasız bir kopyasını klasöre koyarsanız aranabilir." },
       access_denied: { title: "Erişim izni yok", help: "Windows bu dosyayı okumaya izin vermedi ya da dosya başka bir programda açık. Dosyayı kapatıp tekrar deneyin." },
-      too_large: { title: "Çok büyük", help: "Dosya, okuma sınırını (16 MB metin) aşıyor. Bölerek kaydederseniz aranabilir." },
+      too_large: { title: "Okuma sınırı aşıldı", help: "Dosya, kendi biçimi için tanımlanan boyut, görsel veya hücre sınırını aşıyor. Ayrıntıyı inceleyin; dosyayı daha küçük parçalara ayırıp tekrar deneyin." },
       timeout: { title: "Zaman aşımı", help: "Sayfa tanıma işlemi süre sınırında bitmedi. Çok büyük veya çok karmaşık sayfalarda olur; tekrar deneyin." },
       engine_missing: { title: "Okuma bileşeni eksik", help: "Metin tanıma veya PDF bileşeni yüklenemedi. Uygulamayı yeniden kurmak sorunu giderir." },
       damaged: { title: "Bozuk veya biçimi hatalı", help: "Dosya bozuk ya da uzantısı içeriğiyle uyuşmuyor. Orijinal programında açılıp açılmadığını kontrol edin." },

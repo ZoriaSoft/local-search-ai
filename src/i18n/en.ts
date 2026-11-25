@@ -191,7 +191,7 @@ export const en: Strings = {
     reasons: {
       encrypted: { title: "Password protected", help: "The file is password protected and could not be opened. Put a copy without a password in the folder to search it." },
       access_denied: { title: "Access denied", help: "Windows did not allow reading this file, or it is open in another program. Close it and try again." },
-      too_large: { title: "Too large", help: "The file exceeds the reading limit (16 MB of text). Split it into smaller files to search it." },
+      too_large: { title: "Reading limit exceeded", help: "The file exceeds its format's size, image or cell limit. Check the details, then split it into smaller files and try again." },
       timeout: { title: "Timed out", help: "Recognizing the page did not finish in time. This happens on very large or complex pages; try again." },
       engine_missing: { title: "Reading component missing", help: "The text recognition or PDF component could not be loaded. Reinstalling the app fixes this." },
       damaged: { title: "Damaged or wrong format", help: "The file is damaged or its extension does not match its contents. Check whether it opens in its own program." },

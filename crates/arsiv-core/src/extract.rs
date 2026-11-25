@@ -4,7 +4,7 @@
 //! page is rendered at 300 DPI and OCR'd (handles scanned and mixed PDFs).
 //! Images: OCR. DOCX: document/headers/footers XML. XLSX: every sheet's cells.
 
-use std::io::Read;
+use std::io::{BufRead, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -29,6 +29,31 @@ const MAX_RENDER_EDGE: i32 = 7000;
 /// Plain-text files above this are reported as failures rather than loaded
 /// whole into one preview page (logs and data dumps, not documents).
 pub const MAX_TEXT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// Bounds apply to decoded pixels, not the compressed image size. Rotation
+/// and OCR conversions can each need another image-sized allocation.
+pub(crate) const MAX_IMAGE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_IMAGE_DECODE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_IMAGE_EDGE: u32 = 20_000;
+const MAX_IMAGE_PIXELS: u64 = 50_000_000;
+pub(crate) const MAX_OFFICE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_OFFICE_ENTRIES: usize = 4096;
+const MAX_SHARED_STRINGS: u64 = 100_000;
+const MAX_SHEET_CELLS: u64 = 250_000;
+const MAX_WORKBOOK_CELLS: u64 = 1_000_000;
+const MAX_WORKBOOK_SHEETS: usize = 256;
+
+#[derive(Clone, Copy)]
+struct OfficeLimits {
+    member_bytes: usize,
+    expanded_bytes: usize,
+    text_bytes: usize,
+}
+
+const OFFICE_LIMITS: OfficeLimits = OfficeLimits {
+    member_bytes: 8 * 1024 * 1024,
+    expanded_bytes: 32 * 1024 * 1024,
+    text_bytes: 16 * 1024 * 1024,
+};
 /// Cancellation flag for callers that never cancel.
 static NEVER: AtomicBool = AtomicBool::new(false);
 
@@ -194,8 +219,8 @@ impl Extractor {
                 let _slot = self.budget.acquire();
                 vec![self.ocr_image_file(path, &ocr, cancel)?]
             }
-            FileKind::Word => docx(path)?,
-            FileKind::Excel => xlsx(path)?,
+            FileKind::Word => docx_cancellable(path, cancel)?,
+            FileKind::Excel => xlsx_cancellable(path, cancel)?,
             FileKind::Text | FileKind::Log => txt(path)?,
         };
         if let Some(first) = pages.iter().find_map(|p| p.error.as_deref()) {
@@ -388,7 +413,7 @@ impl Extractor {
         };
         match FileKind::from_path(path) {
             Some(FileKind::Image) => {
-                let gray = image::open(path)?.into_luma8();
+                let gray = open_upright(path)?.0.into_luma8();
                 Ok(vec![Some(estimate(&gray, 0)?)])
             }
             Some(FileKind::Pdf) => {
@@ -421,7 +446,12 @@ impl Extractor {
 pub fn open_upright(path: &Path) -> Result<(image::DynamicImage, bool)> {
     use image::ImageDecoder;
     let decode = || -> Result<(image::DynamicImage, bool)> {
-        let mut decoder = image::ImageReader::open(path)?.with_guessed_format()?.into_decoder()?;
+        let file = std::fs::File::open(path)?;
+        if file.metadata()?.len() > MAX_IMAGE_FILE_BYTES {
+            bail!("Image file exceeds the {} MiB input limit", MAX_IMAGE_FILE_BYTES / (1024 * 1024));
+        }
+        let reader = image::ImageReader::new(std::io::BufReader::new(file)).with_guessed_format()?;
+        let mut decoder = checked_image_decoder(reader)?;
         let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
         let mut image = image::DynamicImage::from_decoder(decoder)?;
         let rotated = orientation != image::metadata::Orientation::NoTransforms;
@@ -429,6 +459,31 @@ pub fn open_upright(path: &Path) -> Result<(image::DynamicImage, bool)> {
         Ok((image, rotated))
     };
     decode().with_context(|| format!("Cannot decode image {}", path.display()))
+}
+
+/// `into_decoder` does not reserve the output buffer against `max_alloc` as
+/// `ImageReader::decode` does. Check it explicitly before `from_decoder`,
+/// including when the decoder backend only implements dimensional limits.
+pub(crate) fn checked_image_decoder<'a, R: BufRead + Seek + 'a>(
+    mut reader: image::ImageReader<R>,
+) -> Result<impl image::ImageDecoder + 'a> {
+    use image::ImageDecoder;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_EDGE);
+    limits.max_image_height = Some(MAX_IMAGE_EDGE);
+    limits.max_alloc = Some(MAX_IMAGE_DECODE_BYTES);
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder()?;
+    let (width, height) = decoder.dimensions();
+    limits.check_dimensions(width, height)?;
+    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
+        || decoder.total_bytes() > MAX_IMAGE_DECODE_BYTES
+    {
+        bail!("Image decode exceeds the pixel or memory budget");
+    }
+    limits.reserve(decoder.total_bytes())?;
+    decoder.set_limits(limits)?;
+    Ok(decoder)
 }
 
 fn prepare_for_ocr(page: GrayImage, deskew: bool) -> (GrayImage, Option<u8>) {
@@ -470,65 +525,172 @@ fn unique() -> u64 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+fn check_cancel(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(Cancelled.into());
+    }
+    Ok(())
+}
+
+/// Read limits count actual expanded bytes, never a ZIP's claimed size. A
+/// cancellation during a read is preserved as `Cancelled`, not an IO failure.
+pub(crate) fn read_bounded(mut reader: impl Read, limit: usize, cancel: Option<&AtomicBool>) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(Cancelled.into());
+        }
+        let count = reader.read(&mut buffer)?;
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(Cancelled.into());
+        }
+        if count == 0 {
+            return Ok(bytes);
+        }
+        if count > limit.saturating_sub(bytes.len()) {
+            bail!("Expanded input exceeds the {limit}-byte read budget");
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn open_office_zip(path: &Path, cancel: &AtomicBool) -> Result<zip::ZipArchive<std::fs::File>> {
+    check_cancel(cancel)?;
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_OFFICE_FILE_BYTES {
+        bail!("Office file exceeds the {} MiB input limit", MAX_OFFICE_FILE_BYTES / (1024 * 1024));
+    }
+    let archive = zip::ZipArchive::new(file).context("Not a valid Office ZIP file")?;
+    if archive.len() > MAX_OFFICE_ENTRIES {
+        bail!("Office ZIP exceeds the {MAX_OFFICE_ENTRIES}-member limit");
+    }
+    check_cancel(cancel)?;
+    Ok(archive)
+}
+
+fn office_member(
+    mut member: impl Read,
+    declared_size: u64,
+    remaining: &mut usize,
+    limits: OfficeLimits,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>> {
+    check_cancel(cancel)?;
+    if declared_size > limits.member_bytes as u64 {
+        bail!("Office ZIP member exceeds the {}-byte expansion budget", limits.member_bytes);
+    }
+    if declared_size > *remaining as u64 {
+        bail!("Office ZIP exceeds the aggregate expansion budget");
+    }
+    let bytes = read_bounded(&mut member, limits.member_bytes.min(*remaining), Some(cancel))
+        .context("Cannot read bounded Office ZIP member")?;
+    *remaining -= bytes.len();
+    Ok(bytes)
+}
+
+/// Shared across all sheets/parts so many individually small parts cannot
+/// produce an unbounded document. Formatting writes directly into the result.
+struct TextOutput {
+    text: String,
+    remaining: usize,
+}
+
+impl TextOutput {
+    fn new(limit: usize) -> Self {
+        Self { text: String::new(), remaining: limit }
+    }
+
+    fn push(&mut self, text: &str) -> Result<()> {
+        std::fmt::Write::write_str(self, text).map_err(|_| anyhow!("Office extracted text exceeds the text budget"))
+    }
+}
+
+impl std::fmt::Write for TextOutput {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        if text.len() > self.remaining {
+            return Err(std::fmt::Error);
+        }
+        self.text.push_str(text);
+        self.remaining -= text.len();
+        Ok(())
+    }
+}
+
 /// DOCX: body plus headers/footers/footnotes, one logical page.
 pub fn docx(path: &Path) -> Result<Vec<PageText>> {
-    let file = std::fs::File::open(path)?;
-    let mut archive = zip::ZipArchive::new(file).context("Not a valid DOCX (zip) file")?;
+    docx_cancellable(path, &NEVER)
+}
+
+fn docx_cancellable(path: &Path, cancel: &AtomicBool) -> Result<Vec<PageText>> {
+    docx_with_limits(path, cancel, OFFICE_LIMITS)
+}
+
+fn docx_with_limits(path: &Path, cancel: &AtomicBool, limits: OfficeLimits) -> Result<Vec<PageText>> {
+    let mut archive = open_office_zip(path, cancel)?;
     let wanted = |n: &str| {
         n == "word/document.xml"
             || (n.starts_with("word/header") || n.starts_with("word/footer")) && n.ends_with(".xml")
             || n == "word/footnotes.xml"
             || n == "word/endnotes.xml"
     };
-    let mut names: Vec<String> = archive
-        .file_names()
-        .filter_map(|n| n.ok())
-        .filter(|n| wanted(n))
-        .map(|n| n.into_owned())
-        .collect();
+    let mut names = Vec::new();
+    for name in archive.file_names() {
+        check_cancel(cancel)?;
+        let name = name?;
+        if wanted(&name) {
+            names.push(name.into_owned());
+        }
+    }
     if !names.iter().any(|n| n == "word/document.xml") {
         bail!("DOCX has no word/document.xml");
     }
-    names.sort_by_key(|n| (n != "word/document.xml", n.clone()));
-    let mut text = String::new();
+    names.sort_by(|a, b| (a != "word/document.xml").cmp(&(b != "word/document.xml")).then(a.cmp(b)));
+    let mut out = TextOutput::new(limits.text_bytes);
+    let mut remaining = limits.expanded_bytes;
     for name in names {
-        let mut xml = String::new();
-        archive.by_name(&name)?.read_to_string(&mut xml)?;
-        docx_xml_text(&xml, &mut text)?;
+        let member = archive.by_name(&name)?;
+        let size = member.size();
+        let bytes = office_member(member, size, &mut remaining, limits, cancel)
+            .with_context(|| format!("Cannot read DOCX part {name}"))?;
+        let xml = std::str::from_utf8(&bytes).context("DOCX XML is not UTF-8")?;
+        docx_xml_text(xml, &mut out, cancel)?;
     }
-    Ok(vec![PageText::new(0, text, TextSource::Native, None)])
+    check_cancel(cancel)?;
+    Ok(vec![PageText::new(0, out.text, TextSource::Native, None)])
 }
 
-fn docx_xml_text(xml: &str, out: &mut String) -> Result<()> {
+fn docx_xml_text(xml: &str, out: &mut TextOutput, cancel: &AtomicBool) -> Result<()> {
     let mut reader = Reader::from_str(xml);
     let mut in_text = false;
     loop {
+        check_cancel(cancel)?;
         match reader.read_event()? {
             Event::Start(e) if e.local_name().as_ref() == "t" => in_text = true,
             Event::End(e) if e.local_name().as_ref() == "t" => in_text = false,
-            Event::Text(t) if in_text => out.push_str(&t.xml10_content()),
-            Event::CData(t) if in_text => out.push_str(&t.into_inner()),
+            Event::Text(t) if in_text => out.push(&t.xml10_content())?,
+            Event::CData(t) if in_text => out.push(&t.into_inner())?,
             Event::GeneralRef(r) if in_text => {
                 if let Some(ch) = r.resolve_char_ref()? {
-                    out.push(ch);
+                    out.push(ch.encode_utf8(&mut [0; 4]))?;
                 } else {
                     match r.as_ref() {
-                        "amp" => out.push('&'),
-                        "lt" => out.push('<'),
-                        "gt" => out.push('>'),
-                        "quot" => out.push('"'),
-                        "apos" => out.push('\''),
+                        "amp" => out.push("&")?,
+                        "lt" => out.push("<")?,
+                        "gt" => out.push(">")?,
+                        "quot" => out.push("\"")?,
+                        "apos" => out.push("'")?,
                         _ => {}
                     }
                 }
             }
             Event::Empty(e) => match e.local_name().as_ref() {
-                "tab" => out.push('\t'),
-                "br" | "cr" => out.push('\n'),
+                "tab" => out.push("\t")?,
+                "br" | "cr" => out.push("\n")?,
                 _ => {}
             },
             Event::End(e) if matches!(e.local_name().as_ref(), "p" | "tc") => {
-                out.push(if e.local_name().as_ref() == "tc" { '\t' } else { '\n' })
+                out.push(if e.local_name().as_ref() == "tc" { "\t" } else { "\n" })?;
             }
             Event::Eof => break,
             _ => {}
@@ -537,29 +699,269 @@ fn docx_xml_text(xml: &str, out: &mut String) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct WorkbookCounts {
+    strings: u64,
+    cells: u64,
+    sheets: usize,
+}
+
+#[derive(Default)]
+struct SheetBounds {
+    min: Option<(u32, u32)>,
+    max: (u32, u32),
+}
+
+impl SheetBounds {
+    fn include(&mut self, position: (u32, u32)) -> Result<()> {
+        self.min = Some(match self.min {
+            Some(min) => (min.0.min(position.0), min.1.min(position.1)),
+            None => position,
+        });
+        self.max = (self.max.0.max(position.0), self.max.1.max(position.1));
+        let min = self.min.unwrap();
+        check_sheet_rectangle(min, self.max)
+    }
+}
+
+fn check_sheet_rectangle(min: (u32, u32), max: (u32, u32)) -> Result<()> {
+    if max.0 < min.0 || max.1 < min.1 {
+        bail!("XLSX has a reversed cell rectangle");
+    }
+    let cells = (u64::from(max.0 - min.0) + 1) * (u64::from(max.1 - min.1) + 1);
+    if cells > MAX_SHEET_CELLS {
+        bail!("XLSX cell rectangle exceeds the {MAX_SHEET_CELLS}-cell memory budget");
+    }
+    Ok(())
+}
+
+/// Parse before Calamine: it builds a dense range from the actual sparse
+/// cells, even when the worksheet's dimension is missing or understates it.
+fn cell_position(value: &str) -> Result<(u32, u32)> {
+    let split = value.find(|ch: char| !ch.is_ascii_alphabetic()).unwrap_or(value.len());
+    let (letters, digits) = value.split_at(split);
+    if letters.is_empty() || digits.is_empty() || !digits.bytes().all(|ch| ch.is_ascii_digit()) {
+        bail!("Invalid XLSX cell reference: {value}");
+    }
+    let mut column = 0u32;
+    for letter in letters.bytes() {
+        column = column.checked_mul(26).and_then(|n| n.checked_add(u32::from(letter.to_ascii_uppercase() - b'A') + 1))
+            .ok_or_else(|| anyhow!("XLSX column is out of range"))?;
+        if column > 16_384 {
+            bail!("XLSX column is out of range");
+        }
+    }
+    let row = digits.parse::<u32>().context("XLSX row is out of range")?;
+    if row == 0 || row > 1_048_576 {
+        bail!("XLSX row is out of range");
+    }
+    Ok((row - 1, column - 1))
+}
+
+fn bounded_count(value: &str, maximum: u64, label: &str) -> Result<()> {
+    let count = value.parse::<u64>().with_context(|| format!("Invalid XLSX {label}"))?;
+    if count > maximum {
+        bail!("XLSX {label} exceeds the {maximum}-entry memory budget");
+    }
+    Ok(())
+}
+
+fn preflight_xlsx_xml(xml: &str, counts: &mut WorkbookCounts, cancel: &AtomicBool) -> Result<()> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().expand_empty_elements = true;
+    let mut in_sheet = false;
+    let mut in_strings = false;
+    let mut row = 0u32;
+    let mut column = 0u32;
+    let mut bounds = SheetBounds::default();
+    let mut sheet_cells = 0u64;
+    loop {
+        check_cancel(cancel)?;
+        match reader.read_event()? {
+            Event::Start(element) => match element.local_name().as_ref() {
+                "sst" => {
+                    in_strings = true;
+                    for attribute in element.attributes() {
+                        let attribute = attribute?;
+                        match attribute.key.as_ref() {
+                            "uniqueCount" => bounded_count(&attribute.value, MAX_SHARED_STRINGS, "shared-string uniqueCount")?,
+                            "count" => bounded_count(&attribute.value, MAX_WORKBOOK_CELLS, "shared-string count")?,
+                            _ => {}
+                        }
+                    }
+                }
+                "si" if in_strings => {
+                    counts.strings += 1;
+                    if counts.strings > MAX_SHARED_STRINGS {
+                        bail!("XLSX shared strings exceed the memory budget");
+                    }
+                }
+                "sheet" => {
+                    counts.sheets += 1;
+                    if counts.sheets > MAX_WORKBOOK_SHEETS {
+                        bail!("XLSX exceeds the {MAX_WORKBOOK_SHEETS}-sheet memory budget");
+                    }
+                }
+                "dimension" => {
+                    if let Some(reference) = element.try_get_attribute("ref")? {
+                        let mut positions = reference.value.split(':');
+                        let min = cell_position(positions.next().unwrap_or_default())?;
+                        let max = positions.next().map(cell_position).transpose()?.unwrap_or(min);
+                        if positions.next().is_some() {
+                            bail!("Invalid XLSX dimension");
+                        }
+                        check_sheet_rectangle(min, max)?;
+                    }
+                }
+                "sheetData" => in_sheet = true,
+                "row" if in_sheet => {
+                    if let Some(reference) = element.try_get_attribute("r")? {
+                        let value = reference.value.parse::<u32>().context("Invalid XLSX row index")?;
+                        if value == 0 || value > 1_048_576 {
+                            bail!("XLSX row is out of range");
+                        }
+                        row = value - 1;
+                    }
+                }
+                "c" if in_sheet => {
+                    let position = match element.try_get_attribute("r")? {
+                        Some(reference) => cell_position(&reference.value)?,
+                        None if row < 1_048_576 && column < 16_384 => (row, column),
+                        None => bail!("XLSX implicit cell is out of range"),
+                    };
+                    column = position.1;
+                    sheet_cells += 1;
+                    if sheet_cells > MAX_SHEET_CELLS {
+                        bail!("XLSX actual sheet cells exceed the memory budget");
+                    }
+                    counts.cells += 1;
+                    if counts.cells > MAX_WORKBOOK_CELLS {
+                        bail!("XLSX actual cells exceed the memory budget");
+                    }
+                    bounds.include(position)?;
+                }
+                _ => {}
+            },
+            Event::End(element) => match element.local_name().as_ref() {
+                "sst" => in_strings = false,
+                "sheetData" => in_sheet = false,
+                "row" if in_sheet => { row += 1; column = 0; }
+                "c" if in_sheet => column += 1,
+                _ => {}
+            },
+            Event::Eof => return Ok(()),
+            _ => {}
+        }
+    }
+}
+
+fn preflight_xlsx(archive: &mut zip::ZipArchive<std::fs::File>, cancel: &AtomicBool, limits: OfficeLimits) -> Result<()> {
+    let mut remaining = limits.expanded_bytes;
+    let mut counts = WorkbookCounts::default();
+    // Relationships can route Calamine to nonstandard member paths. Inspect
+    // every expanded member rather than trusting xl/worksheets or its suffix.
+    for index in 0..archive.len() {
+        let member = archive.by_index(index)?;
+        let size = member.size();
+        let name = member.name()?.into_owned();
+        let bytes = office_member(member, size, &mut remaining, limits, cancel)
+            .with_context(|| format!("Cannot preflight XLSX part {name}"))?;
+        let content = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+        let is_xml = content.iter().find(|byte| !byte.is_ascii_whitespace()).is_some_and(|byte| *byte == b'<');
+        let is_xml_name = name.rsplit('.').next().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("xml") || extension.eq_ignore_ascii_case("rels")
+        });
+        if is_xml || is_xml_name {
+            let xml = std::str::from_utf8(&bytes).context("XLSX XML is not UTF-8")?;
+            preflight_xlsx_xml(xml, &mut counts, cancel)
+                .with_context(|| format!("Unsafe XLSX metadata in {name}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Only third-party workbook parsing is isolated: malformed metadata is a
+/// file failure and cannot unwind out of the indexing/startup worker.
+fn calamine_read<T>(read: impl FnOnce() -> std::result::Result<T, calamine::XlsxError>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)) {
+        Ok(result) => result.map_err(|error| anyhow!("Cannot read workbook: {error}")),
+        Err(_) => bail!("Workbook parser panicked on malformed input"),
+    }
+}
+
+fn xlsx_cell_is_blank(cell: &calamine::DataRef<'_>) -> bool {
+    use calamine::DataRef;
+    match cell {
+        DataRef::Empty => true,
+        DataRef::String(value) | DataRef::DateTimeIso(value) | DataRef::DurationIso(value) => value.is_empty(),
+        DataRef::SharedString(value) => value.is_empty(),
+        _ => false,
+    }
+}
+
+fn push_xlsx_cell(out: &mut TextOutput, cell: &calamine::DataRef<'_>) -> Result<()> {
+    use std::fmt::Write as _;
+    use calamine::DataRef;
+    let result = match cell {
+        DataRef::Empty => Ok(()),
+        DataRef::String(value) | DataRef::DateTimeIso(value) | DataRef::DurationIso(value) => out.write_str(value),
+        DataRef::SharedString(value) => out.write_str(value),
+        DataRef::Int(value) => write!(out, "{value}"),
+        DataRef::Float(value) => write!(out, "{value}"),
+        DataRef::Bool(value) => write!(out, "{value}"),
+        DataRef::DateTime(value) => write!(out, "{value}"),
+        DataRef::Error(value) => write!(out, "{value}"),
+    };
+    result.map_err(|_| anyhow!("Office extracted text exceeds the text budget"))
+}
+
 /// XLSX: one logical page per sheet, cells tab-separated, rows newline-separated.
 pub fn xlsx(path: &Path) -> Result<Vec<PageText>> {
-    use calamine::{open_workbook_auto, Data, Reader as _};
-    let mut workbook = open_workbook_auto(path).map_err(|e| anyhow!("Cannot open workbook: {e}"))?;
+    xlsx_cancellable(path, &NEVER)
+}
+
+fn xlsx_cancellable(path: &Path, cancel: &AtomicBool) -> Result<Vec<PageText>> {
+    xlsx_with_limits(path, cancel, OFFICE_LIMITS)
+}
+
+fn xlsx_with_limits(path: &Path, cancel: &AtomicBool, limits: OfficeLimits) -> Result<Vec<PageText>> {
+    use calamine::{Reader as _, ReaderRef as _};
+    let mut archive = open_office_zip(path, cancel)?;
+    preflight_xlsx(&mut archive, cancel, limits)?;
+    check_cancel(cancel)?;
+    let file = archive.into_inner();
+    let mut workbook = calamine_read(|| calamine::Xlsx::new(file))?;
     let mut pages = Vec::new();
+    let mut out = TextOutput::new(limits.text_bytes);
     for (index, name) in workbook.sheet_names().to_vec().into_iter().enumerate() {
-        let range = workbook
-            .worksheet_range(&name)
-            .map_err(|e| anyhow!("Cannot read sheet {name}: {e}"))?;
-        let mut text = format!("{name}\n");
+        check_cancel(cancel)?;
+        // Borrow shared strings: worksheet_range() would clone a large shared
+        // string for every referencing cell before the text budget can act.
+        let book = &mut workbook;
+        let sheet_name = name.as_str();
+        let range = calamine_read(move || book.worksheet_range_ref(sheet_name))?;
+        check_cancel(cancel)?;
+        out.push(&name)?;
+        out.push("\n")?;
+        let leading_columns = range.start().map_or(0, |(_, column)| column);
         for row in range.rows() {
-            let cells: Vec<String> = row
-                .iter()
-                .filter(|c| !matches!(c, Data::Empty))
-                .map(|c| c.to_string())
-                .collect();
-            if !cells.is_empty() {
-                text.push_str(&cells.join("\t"));
-                text.push('\n');
+            check_cancel(cancel)?;
+            if let Some(last) = row.iter().rposition(|cell| !xlsx_cell_is_blank(cell)) {
+                for _ in 0..leading_columns {
+                    out.push("\t")?;
+                }
+                for (column, cell) in row[..=last].iter().enumerate() {
+                    if column != 0 {
+                        out.push("\t")?;
+                    }
+                    push_xlsx_cell(&mut out, cell)?;
+                }
+                out.push("\n")?;
             }
         }
-        pages.push(PageText::new(index, text, TextSource::Native, None));
+        pages.push(PageText::new(index, std::mem::take(&mut out.text), TextSource::Native, None));
     }
+    check_cancel(cancel)?;
     Ok(pages)
 }
 
@@ -929,5 +1331,283 @@ mod budget_tests {
         assert_eq!(ocr_calls, 3, "probe, page 1 (read), page 2 (killed); page 3 never started");
         let scratch: Vec<_> = std::fs::read_dir(dir.path().join("scratch")).unwrap().collect();
         assert!(scratch.is_empty(), "scratch renders left behind: {scratch:?}");
+    }
+}
+
+
+#[cfg(test)]
+pub(crate) mod parser_test_support {
+    use std::io::Write;
+    use std::path::Path;
+
+    pub(crate) fn write_zip(path: &Path, members: &[(&str, &str)]) {
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .last_modified_time(zip::DateTime::default());
+        for (name, text) in members {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(text.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    /// A real OOXML package, not just the worksheet XML: shared-string
+    /// metadata is consumed during Calamine construction, before any sheet.
+    pub(crate) fn write_xlsx(path: &Path, sheet_xml: &str, shared_xml: Option<&str>) {
+        let mut members = vec![
+            ("[Content_Types].xml", r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>"#),
+            ("_rels/.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#),
+            ("xl/workbook.xml", r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sayfa" sheetId="1" r:id="rId1"/></sheets></workbook>"#),
+            ("xl/_rels/workbook.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#),
+            ("xl/worksheets/sheet1.xml", sheet_xml),
+        ];
+        if let Some(shared) = shared_xml {
+            members.push(("xl/sharedStrings.xml", shared));
+        }
+        write_zip(path, &members);
+    }
+
+    /// Deliberately contains no pixel data. A decoder may inspect the tiny
+    /// header, but budget rejection must precede allocating/reading pixels.
+    pub(crate) fn bmp_header(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![0u8; 54];
+        bytes[..2].copy_from_slice(b"BM");
+        bytes[2..6].copy_from_slice(&54u32.to_le_bytes());
+        bytes[10..14].copy_from_slice(&54u32.to_le_bytes());
+        bytes[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bytes[18..22].copy_from_slice(&width.to_le_bytes());
+        bytes[22..26].copy_from_slice(&height.to_le_bytes());
+        bytes[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bytes[28..30].copy_from_slice(&24u16.to_le_bytes());
+        bytes
+    }
+}
+
+#[cfg(test)]
+mod parser_budget_tests {
+    use super::*;
+    use super::parser_test_support::{bmp_header, write_xlsx, write_zip};
+
+    const HEALTHY_SHEET: &str = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Sağlıklı fatura</t></is></c></row></sheetData></worksheet>"#;
+
+    #[test]
+    fn malicious_shared_string_counts_are_file_errors_and_the_next_file_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.xlsx");
+        for (attribute, value) in [
+            ("uniqueCount", "18446744073709551615"),
+            ("uniqueCount", "18446744073709551616"),
+            ("count", "18446744073709551615"),
+        ] {
+            let shared = format!("<sst {attribute}=\"{value}\"><si><t>x</t></si></sst>");
+            write_xlsx(&bad, HEALTHY_SHEET, Some(&shared));
+            let error = xlsx(&bad).unwrap_err();
+            assert!(format!("{error:#}").contains("shared-string"), "{error:#}");
+        }
+        let good = dir.path().join("good.xlsx");
+        write_xlsx(&good, HEALTHY_SHEET, None);
+        assert_eq!(xlsx(&good).unwrap()[0].text, "Sayfa\nSağlıklı fatura\n");
+    }
+
+    #[test]
+    fn actual_shared_strings_cannot_bypass_a_small_declared_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strings.xlsx");
+        let shared = format!("<sst uniqueCount=\"1\">{}</sst>", "<si><t>x</t></si>".repeat(MAX_SHARED_STRINGS as usize + 1));
+        write_xlsx(&path, HEALTHY_SHEET, Some(&shared));
+        let error = xlsx(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("shared strings exceed"), "{error:#}");
+    }
+
+    #[test]
+    fn calamine_panics_are_contained_to_one_file() {
+        let error = calamine_read(|| -> std::result::Result<(), calamine::XlsxError> {
+            panic!("capacity overflow");
+        }).unwrap_err();
+        assert!(format!("{error:#}").contains("Workbook parser panicked"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("healthy.xlsx");
+        write_xlsx(&path, HEALTHY_SHEET, None);
+        assert!(xlsx(&path).unwrap()[0].text.contains("Sağlıklı fatura"));
+    }
+
+    #[test]
+    fn sparse_cells_are_bounded_even_when_dimensions_lie_or_are_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.xlsx");
+        for dimension in ["", "<dimension ref=\"A1\"/>", "<dimension ref=\"A1:XFD1048576\"/>"] {
+            let sheet = format!("<worksheet>{dimension}<sheetData><row r=\"1\"><c r=\"A1\"><v>1</v></c></row><row r=\"1048576\"><c r=\"XFD1048576\"><v>2</v></c></row></sheetData></worksheet>");
+            write_xlsx(&path, &sheet, None);
+            let error = xlsx(&path).unwrap_err();
+            assert!(format!("{error:#}").contains("cell rectangle"), "{error:#}");
+        }
+        // Calamine also accepts omitted cell references, inferring position
+        // from row indices. Those inferred cells must enter the same bounds.
+        let sheet = "<worksheet><dimension ref=\"A1\"/><sheetData><row r=\"1\"><c><v>1</v></c></row><row r=\"1048576\"><c><v>2</v></c></row></sheetData></worksheet>";
+        write_xlsx(&path, sheet, None);
+        assert!(format!("{:#}", xlsx(&path).unwrap_err()).contains("cell rectangle"));
+    }
+
+    #[test]
+    fn overflowing_cell_references_are_rejected_before_calamine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordinates.xlsx");
+        for reference in ["A0", "XFE1", "A1048577", "ZZZZZZZZZZ9999999999999999999999"] {
+            let sheet = format!("<worksheet><sheetData><row><c r=\"{reference}\"><v>1</v></c></row></sheetData></worksheet>");
+            write_xlsx(&path, &sheet, None);
+            let error = xlsx(&path).unwrap_err();
+            assert!(format!("{error:#}").contains("out of range"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn xlsx_retains_blank_columns_and_omits_only_trailing_cells_and_blank_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("columns.xlsx");
+        write_xlsx(&path, r#"<worksheet><dimension ref="A1:F5"/><sheetData>
+            <row r="1"><c r="A1" t="inlineStr"><is><t>Ad</t></is></c><c r="C1"><v>12</v></c><c r="F1"/></row>
+            <row r="2"><c r="B2"><v>5</v></c><c r="D2" t="inlineStr"><is><t>Şimşek</t></is></c><c r="F2" t="inlineStr"><is><t></t></is></c></row>
+            <row r="3"><c r="A3"/><c r="F3"/></row>
+            <row r="5"><c r="C5" t="inlineStr"><is><t>Son</t></is></c></row>
+            </sheetData></worksheet>"#, None);
+        assert_eq!(xlsx(&path).unwrap()[0].text, "Sayfa\nAd\t\t12\n\t5\t\tŞimşek\n\t\tSon\n");
+        // All data may start after column A. Keep the same sheet coordinates.
+        write_xlsx(&path, r#"<worksheet><sheetData><row r="5"><c r="C5"><v>3</v></c><c r="E5"><v>5</v></c></row></sheetData></worksheet>"#, None);
+        assert_eq!(xlsx(&path).unwrap()[0].text, "Sayfa\n\t\t3\t\t5\n");
+    }
+
+    #[test]
+    fn repeated_shared_values_obey_the_text_budget_without_owned_cell_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repeated.xlsx");
+        let shared = format!("<sst uniqueCount=\"1\" count=\"3\"><si><t>{}</t></si></sst>", "ş".repeat(1024));
+        let sheet = r#"<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row><row r="2"><c r="A2" t="s"><v>0</v></c></row><row r="3"><c r="A3" t="s"><v>0</v></c></row></sheetData></worksheet>"#;
+        write_xlsx(&path, sheet, Some(&shared));
+        let limits = OfficeLimits { text_bytes: 4096, ..OFFICE_LIMITS };
+        let error = xlsx_with_limits(&path, &NEVER, limits).unwrap_err();
+        assert!(format!("{error:#}").contains("text budget"), "{error:#}");
+        let pages = xlsx(&path).unwrap();
+        assert_eq!(pages[0].text.matches('ş').count(), 3072);
+    }
+
+    #[test]
+    fn docx_keeps_unicode_entities_cdata_headers_and_footnotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unicode.docx");
+        write_zip(&path, &[
+            ("word/document.xml", r#"<w:document xmlns:w="word"><w:body><w:p><w:r><w:t>Şirket &amp; &lt;ödeme&gt; &#x130;&#287;dır &#351;</w:t></w:r><w:tab/><w:r><w:t><![CDATA[özel <satır>]]></w:t></w:r><w:br/></w:p></w:body></w:document>"#),
+            ("word/header1.xml", r#"<w:hdr xmlns:w="word"><w:p><w:r><w:t>Üst &quot;Başlık&quot;</w:t></w:r></w:p></w:hdr>"#),
+            ("word/footer1.xml", r#"<w:ftr xmlns:w="word"><w:p><w:r><w:t>Alt &apos;Not&apos;</w:t></w:r></w:p></w:ftr>"#),
+            ("word/footnotes.xml", r#"<w:footnotes xmlns:w="word"><w:p><w:r><w:t>Dipnot İstanbul</w:t></w:r></w:p></w:footnotes>"#),
+        ]);
+        let pages = docx(&path).unwrap();
+        assert!(pages[0].text.starts_with("Şirket & <ödeme> İğdır ş\tözel <satır>\n\n"), "{:?}", pages[0].text);
+        for part in ["Üst \"Başlık\"", "Alt 'Not'", "Dipnot İstanbul"] {
+            assert!(pages[0].text.contains(part), "{:?}", pages[0].text);
+        }
+    }
+
+    #[test]
+    fn docx_member_aggregate_and_text_limits_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("expanded.docx");
+        let body = format!("<document><p><t>{}</t></p></document>", "x".repeat(1024));
+        let header = format!("<hdr><p><t>{}</t></p></hdr>", "Ü".repeat(512));
+        write_zip(&path, &[("word/document.xml", &body), ("word/header1.xml", &header)]);
+        assert!(std::fs::metadata(&path).unwrap().len() < body.len() as u64, "fixture is actually compressed");
+        for (limits, expected) in [
+            (OfficeLimits { member_bytes: body.len() - 1, ..OFFICE_LIMITS }, "member exceeds"),
+            (OfficeLimits { expanded_bytes: body.len() + header.len() - 1, ..OFFICE_LIMITS }, "aggregate expansion"),
+            (OfficeLimits { text_bytes: 1024 + 1 + 1024, ..OFFICE_LIMITS }, "text budget"),
+        ] {
+            let error = docx_with_limits(&path, &NEVER, limits).unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{expected}: {error:#}");
+        }
+        assert!(docx(&path).unwrap()[0].text.contains('Ü'));
+    }
+
+    #[test]
+    fn actual_zip_expansion_is_bounded_when_size_metadata_lies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lying-size.docx");
+        let body = format!("<document><p><t>{}</t></p></document>", "x".repeat(8192));
+        write_zip(&path, &[("word/document.xml", &body)]);
+        assert_eq!(docx(&path).unwrap()[0].text.trim(), "x".repeat(8192));
+        let mut bytes = std::fs::read(&path).unwrap();
+        let central = bytes.windows(4).position(|window| window == b"PK\x01\x02").unwrap();
+        bytes[central + 24..central + 28].copy_from_slice(&1u32.to_le_bytes());
+        bytes[22..26].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let limits = OfficeLimits { member_bytes: 64, ..OFFICE_LIMITS };
+        assert!(docx_with_limits(&path, &NEVER, limits).is_err());
+    }
+
+    #[test]
+    fn cancellation_during_zip_expansion_never_returns_partial_text() {
+        struct CancelOnRead<'a, R> { inner: R, cancel: &'a AtomicBool }
+        impl<R: Read> Read for CancelOnRead<'_, R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.inner.read(buffer)?;
+                self.cancel.store(true, Ordering::SeqCst);
+                Ok(read)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancel.docx");
+        write_zip(&path, &[("word/document.xml", "<document><p><t>Belge</t></p></document>")]);
+        let cancel = AtomicBool::new(false);
+        let mut archive = open_office_zip(&path, &cancel).unwrap();
+        let member = archive.by_name("word/document.xml").unwrap();
+        let size = member.size();
+        let mut remaining = OFFICE_LIMITS.expanded_bytes;
+        let error = office_member(CancelOnRead { inner: member, cancel: &cancel }, size, &mut remaining, OFFICE_LIMITS, &cancel).unwrap_err();
+        assert!(is_cancelled(&error), "{error:#}");
+        assert!(is_cancelled(&docx_cancellable(&path, &cancel).unwrap_err()));
+        let mut out = TextOutput::new(100);
+        assert!(is_cancelled(&docx_xml_text("<p><t>partial</t></p>", &mut out, &cancel).unwrap_err()));
+        assert!(out.text.is_empty());
+        assert!(is_cancelled(&xlsx_cancellable(&path, &cancel).unwrap_err()));
+    }
+
+    #[test]
+    fn image_decode_budget_is_checked_before_orientation_and_preview_pixels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.bmp");
+        std::fs::write(&path, bmp_header(10_000, 5000)).unwrap();
+        let error = open_upright(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("pixel or memory budget"), "{error:#}");
+        let extractor = Extractor::new(dir.path(), OcrConfig {
+            binary: dir.path().join("unused"), tessdata: dir.path().into(), language: "tur".into(),
+            timeout: std::time::Duration::from_secs(1), threads: 1,
+        }, dir.path().join("scratch"), 1);
+        let error = extractor.page_image(&path, FileKind::Image, 0, 300).unwrap_err();
+        assert!(format!("{error:#}").contains("pixel or memory budget"), "{error:#}");
+        // Edge and pixel-count caps also apply to low-byte-depth images.
+        for (width, height) in [(MAX_IMAGE_EDGE + 1, 1), (8000, 8000)] {
+            std::fs::write(&path, bmp_header(width, height)).unwrap();
+            assert!(open_upright(&path).is_err());
+        }
+        let encoded = dir.path().join("encoded.png");
+        std::fs::File::create(&encoded).unwrap().set_len(MAX_IMAGE_FILE_BYTES + 1).unwrap();
+        assert!(format!("{:#}", open_upright(&encoded).unwrap_err()).contains("input limit"));
+    }
+
+    #[test]
+    fn bounded_orientation_decode_still_applies_exif_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("phone.jpg");
+        image::RgbImage::from_pixel(2, 3, image::Rgb([40, 80, 120])).save(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let exif = b"Exif\0\0II\x2a\x00\x08\x00\x00\x00\x01\x00\x12\x01\x03\x00\x01\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00";
+        let mut jpeg = original[..2].to_vec();
+        jpeg.extend_from_slice(b"\xff\xe1");
+        jpeg.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(exif);
+        jpeg.extend_from_slice(&original[2..]);
+        std::fs::write(&path, jpeg).unwrap();
+        let (upright, rotated) = open_upright(&path).unwrap();
+        assert!(rotated);
+        assert_eq!((upright.width(), upright.height()), (3, 2));
     }
 }
