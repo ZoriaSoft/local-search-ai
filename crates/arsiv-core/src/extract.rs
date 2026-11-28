@@ -3,7 +3,8 @@
 //! PDF: each page's text layer is used when it carries real text; otherwise the
 //! page is rendered at 300 DPI and OCR'd (handles scanned and mixed PDFs).
 //! Images: OCR. DOCX: document/headers/footers XML. XLSX: every sheet's cells.
-//! RTF, HTML, ODT/ODS/ODP, PPTX, XLS, UDF, EYP and EML: see `formats.rs`.
+//! RTF, HTML, ODT/ODS/ODP, PPTX, XLS, DOC/PPT (97-2003), UDF, EYP, EML and
+//! Outlook MSG: see `formats.rs`.
 
 use std::io::{BufRead, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -243,6 +244,7 @@ impl Extractor {
             FileKind::Word => match ext.as_str() {
                 "odt" => formats::odf(path, cancel, false)?,
                 "rtf" => formats::rtf(path, cancel)?,
+                "doc" => formats::legacy_office(path, cancel, false)?,
                 _ => docx_cancellable(path, cancel)?,
             },
             FileKind::Excel => match ext.as_str() {
@@ -251,11 +253,13 @@ impl Extractor {
             },
             FileKind::Presentation => match ext.as_str() {
                 "odp" => formats::odf(path, cancel, true)?,
+                "ppt" => formats::legacy_office(path, cancel, true)?,
                 _ => formats::pptx(path, cancel)?,
             },
             FileKind::Text if ext == "html" || ext == "htm" => formats::html(path, cancel)?,
             FileKind::Text | FileKind::Log => txt(path)?,
             FileKind::Email if carried => bail!("An e-mail inside a package is not opened"),
+            FileKind::Email if ext == "msg" => self.msg(path, ocr, cancel)?,
             FileKind::Email => self.eml(path, ocr, cancel)?,
             FileKind::Official if ext == "eyp" && carried => bail!("A package inside a package is not opened"),
             FileKind::Official if ext == "eyp" => self.eyp(path, ocr, cancel)?,

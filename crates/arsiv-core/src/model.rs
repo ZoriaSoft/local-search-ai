@@ -14,9 +14,9 @@ pub enum FileKind {
     /// `.log` files: plain text like `Text`, but a kind of its own because
     /// logs can be huge and noisy; new folders leave it off.
     Log,
-    /// Slides: `.pptx`, `.odp` (one page per slide).
+    /// Slides: `.pptx`, `.ppt`, `.odp` (one page per slide).
     Presentation,
-    /// Saved e-mails (`.eml`) with their attachments.
+    /// Saved e-mails (`.eml`, Outlook `.msg`) with their attachments.
     Email,
     /// Turkish official documents: UYAP `.udf`, e-Yazışma `.eyp` packages.
     Official,
@@ -79,18 +79,18 @@ impl FileKind {
         }
     }
 
-    /// Supported extensions; legacy binary .doc/.ppt are deliberately excluded
-    /// (no reliable pure-Rust extractor) and are reported as unsupported.
+    /// Supported extensions. Word/PowerPoint 97-2003 (.doc/.ppt) are read with
+    /// the pure-Rust `undoc` crate, Outlook .msg with `msg_parser`.
     pub fn from_path(path: &std::path::Path) -> Option<Self> {
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();
         match ext.as_str() {
             "pdf" => Some(FileKind::Pdf),
             "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" => Some(FileKind::Image),
-            "docx" | "odt" | "rtf" => Some(FileKind::Word),
+            "docx" | "doc" | "odt" | "rtf" => Some(FileKind::Word),
             "xlsx" | "xlsm" | "xls" | "ods" => Some(FileKind::Excel),
-            "pptx" | "odp" => Some(FileKind::Presentation),
+            "pptx" | "ppt" | "odp" => Some(FileKind::Presentation),
             "udf" | "eyp" => Some(FileKind::Official),
-            "eml" => Some(FileKind::Email),
+            "eml" | "msg" => Some(FileKind::Email),
             "txt" | "csv" | "md" | "json" | "xml" | "html" | "htm" => Some(FileKind::Text),
             "log" => Some(FileKind::Log),
             _ => None,
@@ -202,8 +202,8 @@ mod tests {
         }
         assert_eq!(kind("app.log"), Some(FileKind::Log));
         assert_eq!(kind("APP.LOG"), Some(FileKind::Log));
-        assert_eq!(kind("x.doc"), None);
-        assert_eq!(kind("x.ppt"), None);
+        assert_eq!(kind("x.dot"), None);
+        assert_eq!(kind("x.pps"), None);
         for (name, expected) in [
             ("a.odt", FileKind::Word),
             ("a.RTF", FileKind::Word),
@@ -214,6 +214,11 @@ mod tests {
             ("a.udf", FileKind::Official),
             ("a.EYP", FileKind::Official),
             ("a.eml", FileKind::Email),
+            ("a.doc", FileKind::Word),
+            ("a.DOC", FileKind::Word),
+            ("a.ppt", FileKind::Presentation),
+            ("a.msg", FileKind::Email),
+            ("a.MSG", FileKind::Email),
             ("a.html", FileKind::Text),
             ("a.htm", FileKind::Text),
         ] {

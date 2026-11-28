@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0 — 2026-11-28
+
+- Word and PowerPoint 97-2003 files (.doc, .ppt) are read without Office or
+  LibreOffice. A .ppt gives one page per slide, with its speaker notes.
+- Outlook messages (.msg): sender, recipients, date, subject and body, then
+  each attachment with its own reader. Signature logos in the body are
+  skipped.
+- Password-protected or broken files fail on their own with a clear reason.
+- The list of bundled open-source components is complete again.
+
 ## 0.4.0 — 2026-11-25
 
 - More file types: PowerPoint and OpenDocument presentations, OpenDocument

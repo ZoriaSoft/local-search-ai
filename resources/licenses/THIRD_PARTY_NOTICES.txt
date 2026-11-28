@@ -490,6 +490,10 @@ APPLICATION CORE (RUST)
   https://github.com/mdsteele/rust-cfb
   License text: #f4956b1e2438
 
+- cfb 0.16.0  [MIT]
+  https://github.com/mdsteele/rust-cfb
+  License text: #f4956b1e2438
+
 - cfg-if 1.0.5  [MIT OR Apache-2.0]
   https://github.com/rust-lang/cfg-if
   License text: #b95542c0be3b, #4585f4744a56
@@ -783,6 +787,10 @@ APPLICATION CORE (RUST)
   https://github.com/withoutboats/heck
   License text: #b95542c0be3b, #463fdb26195b
 
+- hex 0.4.3  [MIT OR Apache-2.0]
+  https://github.com/KokaKiwi/rust-hex
+  License text: #81fd98ae93fd, #7e4b23a8a667
+
 - html5ever 0.39.0  [MIT OR Apache-2.0]
   https://github.com/servo/html5ever
   License text: #b95542c0be3b, #ca2bd0c42243
@@ -952,6 +960,11 @@ APPLICATION CORE (RUST)
   https://github.com/danielhenrymantilla/macro_rules_attribute-rs
   License text: #f5d6b75ca4b7, #ea03b1d0099c, #df1908ac68ef
 
+- mail-parser 0.11.9  [Apache-2.0 OR MIT]
+  https://github.com/stalwartlabs/mail-parser
+  The package ships no license file; the standard text of its declared license is included.
+  License text: #8ffe2c5c25b8
+
 - markup5ever 0.39.0  [MIT OR Apache-2.0]
   https://github.com/servo/html5ever
   License text: #b95542c0be3b, #ca2bd0c42243
@@ -1007,6 +1020,10 @@ APPLICATION CORE (RUST)
 - moxcms 0.8.1  [BSD-3-Clause OR Apache-2.0]
   https://github.com/awxkee/moxcms.git
   License text: #bbaf6179de61, #78cdf47f7229
+
+- msg_parser 0.3.6  [MIT]
+  https://github.com/marirs/msg-parser-rs
+  License text: #c9c0cf275f8c
 
 - muda 0.20.0  [Apache-2.0 OR MIT]
   https://github.com/tauri-apps/muda
@@ -1292,7 +1309,7 @@ APPLICATION CORE (RUST)
 - selectors 0.38.0  [MPL-2.0]
   https://github.com/servo/stylo
   The package ships no license file; the standard text of its declared license is included.
-  License text: #b65265111df9
+  License text: #5bcd985d40d2
 
 - semver 1.0.28  [MIT OR Apache-2.0]
   https://github.com/dtolnay/semver
@@ -1601,6 +1618,10 @@ APPLICATION CORE (RUST)
   https://github.com/dtolnay/typetag
   License text: #ed19a80b922d, #a74c5e048f9e
 
+- undoc 0.29.0  [MIT]
+  https://github.com/iyulab/undoc
+  License text: #96ad2c010753
+
 - unicode-ident 1.0.27  [(MIT OR Apache-2.0) AND Unicode-3.0]
   https://github.com/dtolnay/unicode-ident
   License text: #ed19a80b922d, #a74c5e048f9e, #fbfd3a368110
@@ -1617,9 +1638,17 @@ APPLICATION CORE (RUST)
   https://github.com/unicode-rs/unicode-segmentation
   License text: #a4b7b5bfdd36, #b95542c0be3b, #463fdb26195b
 
+- unicode-width 0.2.3  [MIT OR Apache-2.0]
+  https://github.com/unicode-rs/unicode-width
+  License text: #a4b7b5bfdd36, #b95542c0be3b, #463fdb26195b
+
 - unicode_categories 0.1.1  [MIT OR Apache-2.0]
   https://github.com/swgillespie/unicode-categories
   License text: #81fd98ae93fd, #d92a032b6b57
+
+- unparser-shared 0.12.0  [MIT]
+  https://github.com/iyulab/unparser-shared
+  License text: #bfda40effb07
 
 - untrusted 0.9.0  [ISC]
   https://github.com/briansmith/untrusted
@@ -36730,3 +36759,98 @@ freely, subject to the following restrictions:
 2. Altered source versions must be plainly marked as such, and must not be
    misrepresented as being the original software.
 3. This notice may not be removed or altered from any source distribution.
+
+----- #7e4b23a8a667 · hex — LICENSE-MIT -----
+
+Copyright (c) 2013-2014 The Rust Project Developers.
+Copyright (c) 2015-2020 The rust-hex Developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+----- #c9c0cf275f8c · msg_parser — LICENSE -----
+
+MIT License
+
+Copyright (c) 2021 marirs
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+----- #96ad2c010753 · undoc — LICENSE -----
+
+MIT License
+
+Copyright (c) 2025 iyulab
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+----- #bfda40effb07 · unparser-shared — LICENSE -----
+
+MIT License
+
+Copyright (c) 2026 iyulab
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

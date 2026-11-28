@@ -16,7 +16,7 @@
 </p>
 
 Zoria Arşiv, Windows bilgisayarınızdaki belgelerin içinde arama yapar: PDF'ler,
-taranmış evrak ve telefon fotoğrafları, Word, Excel, PowerPoint, OpenDocument, RTF, HTML, e-posta (EML), UYAP (UDF), e-Yazışma (EYP) ve metin dosyaları. Her şey
+taranmış evrak ve telefon fotoğrafları, Word, Excel, PowerPoint, OpenDocument, RTF, HTML, e-posta (EML, Outlook MSG), UYAP (UDF), e-Yazışma (EYP) ve metin dosyaları. Her şey
 bilgisayarınızda, internetsiz çalışır. Hiçbir dosya, dizin ya da arama dışarı
 çıkmaz.
 

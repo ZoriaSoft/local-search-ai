@@ -16,7 +16,7 @@
 </p>
 
 Zoria Arşiv finds words inside the documents on your Windows PC: PDFs,
-scanned papers and phone photos, Word, Excel, PowerPoint, OpenDocument, RTF, HTML, saved emails (EML), UYAP (UDF) and e-Yazışma (EYP) files and plain text. Everything runs
+scanned papers and phone photos, Word, Excel, PowerPoint, OpenDocument, RTF, HTML, saved emails (EML, Outlook MSG), UYAP (UDF) and e-Yazışma (EYP) files and plain text. Everything runs
 offline on your computer. No file, index or search ever leaves it.
 
 - **Full-text search** in PDF (text layer), Word (.docx), Excel (.xlsx/.xlsm),

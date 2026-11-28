@@ -1,8 +1,9 @@
 //! Formats beyond PDF/images/DOCX/XLSX/plain text: RTF, HTML, OpenDocument
-//! (ODT/ODS/ODP), PowerPoint (PPTX), legacy Excel (XLS), UYAP documents (UDF),
-//! e-Yazışma packages (EYP) and saved e-mails (EML).
+//! (ODT/ODS/ODP), PowerPoint (PPTX), legacy Excel (XLS), Word/PowerPoint
+//! 97-2003 (DOC/PPT), UYAP documents (UDF), e-Yazışma packages (EYP) and saved
+//! e-mails (EML, Outlook MSG).
 //!
-//! Containers (EYP, EML) carry other documents. Each carried file is written
+//! Containers (EYP, EML, MSG) carry other documents. Each carried file is written
 //! to the scratch folder and read with the normal per-kind reader, one level
 //! deep: a package inside a package is not opened.
 
@@ -500,6 +501,87 @@ pub(super) fn pptx(path: &Path, cancel: &AtomicBool) -> Result<Vec<PageText>> {
     Ok(pages)
 }
 
+// ---------------------------------------------------------------- DOC / PPT (97-2003)
+
+const OLE_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+
+/// Word 97-2003 (.doc, one page) and PowerPoint 97-2003 (.ppt, one page per
+/// slide, speaker notes included) through the pure-Rust `undoc` crate. A
+/// ".doc" that is really RTF or HTML (old "save as" and web exports do this)
+/// goes to that reader instead. The parser runs isolated: a malformed file
+/// fails alone and never unwinds into the indexing worker.
+pub(super) fn legacy_office(path: &Path, cancel: &AtomicBool, slides: bool) -> Result<Vec<PageText>> {
+    check_cancel(cancel)?;
+    let bytes = file_bytes(path, super::MAX_OFFICE_FILE_BYTES)?;
+    if !slides {
+        if bytes.starts_with(b"{\\rtf") {
+            return rtf(path, cancel);
+        }
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]).to_ascii_lowercase();
+        if head.contains("<html") || head.contains("<!doctype html") {
+            return html(path, cancel);
+        }
+    }
+    if !bytes.starts_with(&OLE_MAGIC) {
+        bail!(if slides { "Not a PowerPoint 97-2003 file" } else { "Not a Word 97-2003 file" });
+    }
+    let document = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| undoc::parse_bytes(&bytes))) {
+        Ok(Ok(document)) => document,
+        Ok(Err(undoc::Error::Encrypted)) => bail!("Password-protected document: its content cannot be read"),
+        Ok(Err(error)) => bail!("Cannot read the document: {error}"),
+        Err(_) => bail!("Document parser panicked on malformed input"),
+    };
+    check_cancel(cancel)?;
+    let mut budget = super::OFFICE_LIMITS.text_bytes;
+    let mut pages = Vec::new();
+    for section in &document.sections {
+        check_cancel(cancel)?;
+        let mut text = section_text(section, slides);
+        if text.len() > budget {
+            let mut cut = budget;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+        }
+        budget -= text.len();
+        pages.push(text);
+        if budget == 0 {
+            break;
+        }
+    }
+    let pages: Vec<String> = if slides { pages } else { vec![pages.join("\n\n")] };
+    if pages.is_empty() {
+        bail!(if slides { "PPT has no slides" } else { "DOC has no text" });
+    }
+    Ok(pages
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| PageText::new(index, tidy(&text), TextSource::Native, None))
+        .collect())
+}
+
+fn section_text(section: &undoc::Section, slides: bool) -> String {
+    let mut lines = Vec::new();
+    for block in &section.content {
+        match block {
+            undoc::Block::Paragraph(paragraph) => lines.push(paragraph.plain_text()),
+            undoc::Block::Table(table) => lines.push(table.plain_text()),
+            _ => {}
+        }
+    }
+    if slides {
+        if let Some(notes) = &section.notes {
+            let notes: Vec<String> = notes.iter().map(|p| p.plain_text()).filter(|t| !t.trim().is_empty()).collect();
+            if !notes.is_empty() {
+                lines.push(String::new());
+                lines.extend(notes);
+            }
+        }
+    }
+    lines.join("\n")
+}
+
 // ---------------------------------------------------------------- XLS / ODS
 
 /// Legacy Excel (.xls) and OpenDocument spreadsheets (.ods): one page per sheet.
@@ -803,6 +885,65 @@ impl Extractor {
         self.append_carried(&mut pages, carried, ocr, cancel)?;
         Ok(renumber(pages))
     }
+
+    /// Outlook message (MSG): page 1 is the headers and body, then each
+    /// attachment read with its own reader. An attached message (embedded or
+    /// a ".msg" file) is read as its text; inline pictures of the body
+    /// (signature logos, cid: images) are skipped like OLE objects.
+    pub(super) fn msg(&self, path: &Path, ocr: &OcrSetup, cancel: &AtomicBool) -> Result<Vec<PageText>> {
+        check_cancel(cancel)?;
+        let bytes = file_bytes(path, MAX_CONTAINER_FILE_BYTES)?;
+        let message = outlook_message(&bytes)?;
+        let mut pages = vec![PageText::new(0, outlook_text(&message), TextSource::Native, None)];
+        let mut carried = Vec::new();
+        let mut nested = Vec::new();
+        let mut total = 0usize;
+        for (index, attachment) in message.attachments.iter().enumerate().take(MAX_CARRIED_FILES) {
+            check_cancel(cancel)?;
+            let name = [&attachment.long_file_name, &attachment.file_name, &attachment.display_name]
+                .into_iter()
+                .map(|n| n.trim())
+                .find(|n| !n.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("attachment-{}", index + 1));
+            if attachment.is_embedded_message() {
+                match attachment.as_message() {
+                    Some(Ok(inner)) => nested.push(format!("{name}\n\n{}", outlook_text(&inner))),
+                    _ => nested.push(format!("{name}\n\n(attached message)")),
+                }
+                continue;
+            }
+            if attachment.attach_method == 6 {
+                continue;
+            }
+            let contents = &attachment.payload_bytes;
+            if contents.len() > MAX_CARRIED_FILE_BYTES || total + contents.len() > MAX_CARRIED_TOTAL_BYTES {
+                pages.push(PageText::failed(0, format!("{name}: attachment exceeds the size limit")));
+                continue;
+            }
+            let kind = FileKind::from_path(Path::new(&name));
+            if kind == Some(FileKind::Email) && name.to_ascii_lowercase().ends_with(".msg") {
+                match outlook_message(contents) {
+                    Ok(inner) => nested.push(format!("{name}\n\n{}", outlook_text(&inner))),
+                    Err(error) => pages.push(PageText::failed(0, format!("{name}: {error:#}"))),
+                }
+                continue;
+            }
+            if kind == Some(FileKind::Image) && !attachment.content_id.trim().is_empty() {
+                continue;
+            }
+            if kind.is_none() {
+                continue;
+            }
+            total += contents.len();
+            carried.push(Carried { name, bytes: contents.clone() });
+        }
+        for text in nested {
+            pages.push(PageText::new(0, text, TextSource::Native, None));
+        }
+        self.append_carried(&mut pages, carried, ocr, cancel)?;
+        Ok(renumber(pages))
+    }
 }
 
 fn renumber(mut pages: Vec<PageText>) -> Vec<PageText> {
@@ -810,6 +951,68 @@ fn renumber(mut pages: Vec<PageText>) -> Vec<PageText> {
         page.index = index;
     }
     pages
+}
+
+/// Parses an Outlook message in isolation: a malformed file fails alone.
+fn outlook_message(bytes: &[u8]) -> Result<msg_parser::Outlook> {
+    if !bytes.starts_with(&OLE_MAGIC) {
+        bail!("Not an Outlook message");
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| msg_parser::Outlook::from_slice(bytes))) {
+        Ok(Ok(message)) => Ok(message),
+        Ok(Err(error)) => bail!("Not a readable Outlook message: {error}"),
+        Err(_) => bail!("Outlook message parser panicked on malformed input"),
+    }
+}
+
+fn person_text(person: &msg_parser::Person) -> String {
+    let name = person.name.trim();
+    // Exchange-internal senders carry an X.500 path, not an e-mail address.
+    let email = person.email.trim();
+    let email = if email.starts_with('/') { "" } else { email };
+    match (name.is_empty(), email.is_empty()) {
+        (false, false) if !name.eq_ignore_ascii_case(email) => format!("{name} <{email}>"),
+        (false, _) => name.to_string(),
+        (true, false) => email.to_string(),
+        (true, true) => String::new(),
+    }
+}
+
+fn outlook_text(message: &msg_parser::Outlook) -> String {
+    let people = |list: &[msg_parser::Person]| list.iter().map(person_text).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", ");
+    let mut lines = Vec::new();
+    let from = person_text(&message.sender);
+    if !from.is_empty() {
+        lines.push(format!("From: {from}"));
+    }
+    for (label, list) in [("To", &message.to), ("Cc", &message.cc)] {
+        let text = people(list);
+        if !text.is_empty() {
+            lines.push(format!("{label}: {text}"));
+        }
+    }
+    let date = [&message.client_submit_time, &message.message_delivery_time, &message.headers.date]
+        .into_iter()
+        .map(|d| d.trim())
+        .find(|d| !d.is_empty());
+    if let Some(date) = date {
+        lines.push(format!("Date: {date}"));
+    }
+    if !message.subject.trim().is_empty() {
+        lines.push(format!("Subject: {}", message.subject.trim()));
+    }
+    let body = if !message.body.trim().is_empty() {
+        message.body.clone()
+    } else if !message.html.trim().is_empty() {
+        html_to_text(&message.html)
+    } else if let Some(html) = message.html_from_rtf() {
+        html_to_text(&html)
+    } else if let Some(rtf) = message.rtf_decompressed() {
+        rtf_to_text(&rtf)
+    } else {
+        String::new()
+    };
+    format!("{}\n\n{}", lines.join("\n"), tidy(&body))
 }
 
 fn address_text(address: &mail_parser::Address<'_>) -> String {
@@ -1068,5 +1271,75 @@ Kar\u351\'3f\'fd taraf \{parantez\}}";
         assert!(first.contains("Subject: Kira sözleşmesi") && first.contains("ayse@example.com") && first.contains("Ekte tutanak var."), "{first}");
         assert_eq!(document.pages.len(), 2, "{:?}", document.pages);
         assert!(document.pages[1].text.starts_with("tutanak.txt\n\n") && document.pages[1].text.contains("demirbaş"));
+    }
+
+    fn legacy_fixture(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy").join(name)
+    }
+
+    #[test]
+    fn doc_97_2003_is_read_without_libreoffice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("eski.doc");
+        std::fs::copy(legacy_fixture("sample.doc"), &path).unwrap();
+        let document = extractor(dir.path()).extract(&path).unwrap();
+        assert_eq!(document.kind, FileKind::Word);
+        assert_eq!(document.pages.len(), 1);
+        let text = &document.pages[0].text;
+        assert!(text.contains("This is Heading1 Text") && text.contains("default style of Normal"), "{text}");
+    }
+
+    #[test]
+    fn ppt_97_2003_gives_one_page_per_slide() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sunum.ppt");
+        std::fs::copy(legacy_fixture("sample.ppt"), &path).unwrap();
+        let document = extractor(dir.path()).extract(&path).unwrap();
+        assert_eq!(document.kind, FileKind::Presentation);
+        assert_eq!(document.pages.len(), 34);
+        assert!(document.pages[0].text.contains("Research talk 101"), "{}", document.pages[0].text);
+        assert!(document.pages[1].text.contains("Purpose of a research talk"));
+    }
+
+    #[test]
+    fn doc_that_is_really_rtf_or_html_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let rtf = dir.path().join("kayit.doc");
+        std::fs::write(&rtf, r"{\rtf1\ansi Kira s\'f6zle\'femesi}").unwrap();
+        let document = extractor(dir.path()).extract(&rtf).unwrap();
+        assert!(document.pages[0].text.contains("Kira"), "{:?}", document.pages);
+        let html = dir.path().join("web.doc");
+        std::fs::write(&html, "<html><body><p>Tutanak metni</p></body></html>").unwrap();
+        let document = extractor(dir.path()).extract(&html).unwrap();
+        assert!(document.pages[0].text.contains("Tutanak metni"));
+    }
+
+    #[test]
+    fn broken_doc_and_msg_fail_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in [("bozuk.doc", &b"not a document"[..]), ("bozuk.ppt", &OLE_MAGIC[..]), ("bozuk.msg", &b"not a message"[..])] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            assert!(extractor(dir.path()).extract(&path).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn msg_reads_headers_body_and_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("posta.msg");
+        std::fs::copy(legacy_fixture("attachment.msg"), &path).unwrap();
+        let document = extractor(dir.path()).extract(&path).unwrap();
+        assert_eq!(document.kind, FileKind::Email);
+        let first = &document.pages[0].text;
+        assert!(first.contains("Subject: FW:") && first.contains("From: Nagisetti, Satya") && first.contains("looks to be a suspicious"), "{first}");
+        assert!(!first.contains("/O=EXCHANGELABS"), "X.500 sender paths are not addresses: {first}");
+        // The attached .doc is read with the DOC reader; the two inline
+        // signature pictures (cid:) are skipped, so no OCR is attempted.
+        assert_eq!(document.pages.len(), 2, "{:?}", document.pages);
+        let attached = &document.pages[1];
+        assert!(!attached.is_failed(), "{:?}", attached.error);
+        assert!(attached.text.starts_with("loan_proposal.doc\n\n"), "{}", attached.text);
+        assert!(attached.text.contains("fake phishing email"), "{}", attached.text);
     }
 }

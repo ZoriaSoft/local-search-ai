@@ -169,11 +169,11 @@ const DOCS: MockDoc[] = DEMO === "en" ? DOCS_EN : DOCS_TR;
 const kindOf = (path: string): FileKind => {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   if (ext === "pdf") return "pdf";
-  if (["docx", "odt", "rtf"].includes(ext)) return "word";
+  if (["docx", "doc", "odt", "rtf"].includes(ext)) return "word";
   if (["xlsx", "xlsm", "xls", "ods"].includes(ext)) return "excel";
-  if (ext === "pptx" || ext === "odp") return "presentation";
+  if (["pptx", "ppt", "odp"].includes(ext)) return "presentation";
   if (ext === "udf" || ext === "eyp") return "official";
-  if (ext === "eml") return "email";
+  if (ext === "eml" || ext === "msg") return "email";
   if (["txt", "csv", "md", "json", "xml", "html", "htm"].includes(ext)) return "text";
   return "image";
 };
@@ -327,7 +327,7 @@ export function createMockBackend(): Backend {
 
   return {
     appInfo: async (): Promise<AppInfo> => ({
-      version: "0.4.0",
+      version: "0.5.0",
       ocrReady: !new URLSearchParams(location.search).has("noocr"),
       ocrDetail: new URLSearchParams(location.search).has("noocr")
         ? "Tesseract model not found: C:\\Program Files\\Zoria Arşiv\\tessdata\\tur.traineddata"

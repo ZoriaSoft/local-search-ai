@@ -93,7 +93,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "arsiv-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -105,6 +105,7 @@ dependencies = [
  "image",
  "lru",
  "mail-parser",
+ "msg_parser",
  "notify",
  "notify-debouncer-full",
  "ort",
@@ -120,6 +121,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokenizers",
+ "undoc",
  "unicode-normalization",
  "walkdir",
  "zip 9.0.3",
@@ -127,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "arsiv-eval"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arsiv-core",
@@ -627,6 +629,17 @@ name = "cfb"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a347dcabdae9c31b0825fd6a8bed285ec9c2acb89c47827126d52fa4f59cece3"
+dependencies = [
+ "fnv",
+ "uuid",
+ "web-time",
+]
+
+[[package]]
+name = "cfb"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fef29b910ef2b9dbecc60168d1568d643c633b0518af970c17e83bd5f6e2c94f"
 dependencies = [
  "fnv",
  "uuid",
@@ -1982,6 +1995,9 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "html5ever"
@@ -2287,7 +2303,7 @@ version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f4200d433cbd5178df7797c9c2e75b348b728e39631cf14520d1e2fc424201f4"
 dependencies = [
- "cfb",
+ "cfb 0.14.0",
 ]
 
 [[package]]
@@ -2884,6 +2900,19 @@ checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "msg_parser"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a0453ec98f292962f9972032a09211daaf7482dfbcaed7f9dfa12f0f6a750fb"
+dependencies = [
+ "hex",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -5759,6 +5788,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "undoc"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f7f89f050ae1ec307ffc765b2802f4227c3b32543fac3ebaf41c9267154fe43"
+dependencies = [
+ "cfb 0.16.0",
+ "encoding_rs",
+ "flate2",
+ "quick-xml 0.42.0",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "unicode-normalization",
+ "unicode-width",
+ "unparser-shared",
+ "zip 9.0.3",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5789,10 +5837,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
+name = "unicode-width"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
+
+[[package]]
 name = "unicode_categories"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39ec24b3121d976906ece63c9daad25b85969647682eee313cb5779fdd69e14e"
+
+[[package]]
+name = "unparser-shared"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6c10cbfd80a3a0b11f39fc9b0c5b4cd4560114c50e643ddf115f1e23fbe865d"
 
 [[package]]
 name = "untrusted"
@@ -6896,7 +6956,7 @@ dependencies = [
 
 [[package]]
 name = "zoria-arsiv"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arsiv-core",
